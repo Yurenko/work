@@ -1,0 +1,16 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+websockets==14.1
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+orjson==3.10.12
+jinja2==3.1.5
+python-multipart==0.0.20
+aiofiles==24.1.0
+py-clob-client-v2>=1.2.0
+eth-account>=0.11.0
+web3>=6.0.0
+predict-sdk>=0.0.20
+eth-account>=0.10.0

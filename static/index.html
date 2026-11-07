@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hedge Bot · Predict.fun + Polymarket</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --card: #121821;
+      --border: #1e2a3a;
+      --text: #e6edf7;
+      --muted: #8b9bb4;
+      --green: #22c55e;
+      --red: #ef4444;
+      --blue: #3b82f6;
+      --yellow: #eab308;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg); color: var(--text); min-height: 100vh;
+    }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 24px; border-bottom: 1px solid var(--border);
+      background: #0d1219;
+    }
+    h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 999px;
+      font-size: 12px; font-weight: 600; margin-left: 8px;
+    }
+    .badge.paper { background: #1e3a5f; color: #93c5fd; }
+    .badge.live { background: #3f1d1d; color: #fca5a5; }
+    .badge.on { background: #14532d; color: #86efac; }
+    .badge.off { background: #374151; color: #d1d5db; }
+    button {
+      border: none; border-radius: 8px; padding: 10px 20px; font-weight: 600;
+      cursor: pointer; font-size: 14px;
+    }
+    #btnToggle.start { background: var(--green); color: #052e16; }
+    #btnToggle.stop { background: var(--red); color: #fff; }
+    #btnTest {
+      background: transparent; color: var(--text);
+      border: 1px solid var(--border); margin-right: 8px;
+    }
+    #btnTest:disabled { opacity: 0.5; cursor: default; }
+    .banner {
+      margin: 12px 24px 0; padding: 10px 14px;
+      border: 1px solid #7f1d1d; background: #3f1d1d; color: #fecaca;
+      border-radius: 8px; font-size: 14px;
+    }
+    main { padding: 20px 24px; max-width: 1200px; margin: 0 auto; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 12px; padding: 16px;
+    }
+    .card h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+    .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #1a2330; }
+    .row:last-child { border-bottom: none; }
+    .label { color: var(--muted); font-size: 13px; }
+    .val { font-variant-numeric: tabular-nums; font-weight: 600; }
+    .up { color: var(--green); }
+    .down { color: var(--red); }
+    .stat { font-size: 28px; font-weight: 700; }
+    .muted { color: var(--muted); font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    #logs {
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      max-height: 220px;
+      overflow-y: auto;
+      color: #9fb0c7;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px; max-height: 240px; overflow-y: auto;
+      background: #0a0e13; padding: 10px; border-radius: 8px; line-height: 1.5;
+    }
+    .full { grid-column: 1 / -1; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Hedge Bot <span id="modeBadge" class="badge paper">PAPER</span>
+        <span id="runBadge" class="badge off">STOPPED</span>
+      </h1>
+      <div class="muted" id="slugLine">—</div>
+    </div>
+    <div>
+      <button id="btnTest" onclick="testBuy()">Test BN $1</button>
+      <button id="btnToggle" class="start" onclick="toggle()">▶ Start</button>
+    </div>
+  </header>
+  <div id="bnBlock" class="banner" hidden></div>
+  <main>
+    <div class="grid">
+      <div class="card">
+        <h2>Predict.fun</h2>
+        <div class="row"><span class="label">Up bid / ask</span>
+          <span class="val"><span class="up" id="bnUpBid">—</span> / <span id="bnUpAsk">—</span></span></div>
+        <div class="row"><span class="label">Down bid / ask</span>
+          <span class="val"><span class="down" id="bnDownBid">—</span> / <span id="bnDownAsk">—</span></span></div>
+        <div class="row"><span class="label">Deposit</span><span class="val" id="pfBal">—</span></div>
+        <div class="row"><span class="label">Quote age</span><span class="val" id="bnAge">—</span></div>
+      </div>
+      <div class="card">
+        <h2>Polymarket</h2>
+        <div class="row"><span class="label">Up bid / ask</span>
+          <span class="val"><span class="up" id="pmUpBid">—</span> / <span id="pmUpAsk">—</span></span></div>
+        <div class="row"><span class="label">Down bid / ask</span>
+          <span class="val"><span class="down" id="pmDownBid">—</span> / <span id="pmDownAsk">—</span></span></div>
+        <div class="row"><span class="label">Deposit</span><span class="val" id="pmBal">—</span></div>
+        <div class="row"><span class="label">Quote age</span><span class="val" id="pmAge">—</span></div>
+      </div>
+      <div class="card">
+        <h2>Market</h2>
+        <div class="row"><span class="label">Time left</span><span class="val stat" id="timeLeft">—</span></div>
+        <div class="row"><span class="label">Entry if sum &lt;</span><span class="val" id="entryMax">0.90</span></div>
+        <div class="row"><span class="label">Exit if sum ≥</span><span class="val" id="exitMin">1.00</span></div>
+      </div>
+      <div class="card">
+        <h2>PnL / Balance</h2>
+        <div class="row"><span class="label">Realized profit</span><span class="val stat" id="pnl">0</span></div>
+        <div class="row"><span class="label">Total balance</span><span class="val" id="totalBal">—</span></div>
+        <div class="row"><span class="label">Next size</span><span class="val" id="recShares">—</span></div>
+        <div class="row"><span class="label">Recovery debt</span><span class="val" id="recDebt">—</span></div>
+      </div>
+      <div class="card full">
+        <h2>Open hedges</h2>
+        <table>
+          <thead><tr>
+            <th>Market</th><th>Status</th><th>Predict</th><th>Polymarket</th><th>Entry Σ</th>
+          </tr></thead>
+          <tbody id="openBody"><tr><td colspan="5" class="muted">none</td></tr></tbody>
+        </table>
+      </div>
+      <div class="card full">
+        <h2>History</h2>
+        <table>
+          <thead><tr>
+            <th>Market</th><th>Polymarket</th><th>Predict</th><th>Σ in → out</th><th>PnL</th>
+          </tr></thead>
+          <tbody id="histBody"><tr><td colspan="5" class="muted">—</td></tr></tbody>
+        </table>
+      </div>
+      <div class="card full">
+        <h2>Logs</h2>
+        <div id="logs"></div>
+      </div>
+    </div>
+  </main>
+  <script>
+  const $ = (id) => document.getElementById(id);
+  function fmt(v, d=3) {
+    if (v === null || v === undefined || Number.isNaN(Number(v))) return '—';
+    return Number(v).toFixed(d);
+  }
+  function ageText(v) {
+    if (v === null || v === undefined || Number.isNaN(Number(v))) return '—';
+    return Number(v).toFixed(1) + 's';
+  }
+  function money(v) {
+    if (v === null || v === undefined || Number.isNaN(Number(v))) return '—';
+    const n = Number(v);
+    return (n < 0 ? '-' : '') + '$' + Math.abs(n).toFixed(2);
+  }
+  function marketLabel(h) {
+    const asset = String(h.asset || 'btc').toUpperCase();
+    const tf = h.tf || '5m';
+    const end = Number(h.market_end || h.opened_at || 0);
+    const when = end ? new Date(end * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    const id = (h.id || '').slice(0, 8);
+    return `<div>${asset} ${tf}${when ? ' · ' + when : ''}</div><div class="muted">${id}</div>`;
+  }
+  function legHtml(leg, closed) {
+    if (!leg || !leg.direction) return '—';
+    const dir = String(leg.direction).toUpperCase();
+    const sh = Number(leg.shares || 0);
+    const req = Number(leg.requested_shares || sh);
+    const got = Number(leg.filled_shares || 0);
+    const shown = got > 0 ? got : sh;
+    const shLabel = (req > 0 && got > 0 && Math.abs(got - req) > 0.05)
+      ? `${got.toFixed(1)}/${req.toFixed(1)} sh`
+      : `${shown.toFixed(1)} sh`;
+    const entry = Number(leg.entry_price);
+    const exit = Number(leg.exit_price);
+    const hasExit = closed && Number.isFinite(exit);
+    const pnl = hasExit ? (exit - entry) * shown : null;
+    const prices = hasExit ? `${fmt(entry)} → ${fmt(exit)}` : `${fmt(entry)}`;
+    const pnlLine = pnl === null ? '' : `<div class="${pnl < 0 ? 'down' : 'up'}">${money(pnl)}</div>`;
+    const result = leg.result ? `<div class="muted">result ${String(leg.result).toUpperCase()}</div>` : '';
+    const st = String(leg.status || '').toUpperCase();
+    const flag = (st && st !== 'FILLED' && st !== 'CLOSED') ? `<div class="down">${st}</div>` : '';
+    const reason = leg.reject_reason ? `<div class="down">${leg.reject_reason}</div>` : '';
+    return `<div class="${dir === 'UP' ? 'up' : 'down'}">${dir} · ${shLabel}</div>${result}<div>${prices}</div>${pnlLine}${flag}${reason}`;
+  }
+
+  function applyState(s) {
+    if (!s) return;
+    const running = !!s.running;
+    const mode = (s.mode || 'PAPER').toUpperCase();
+    $('runBadge').textContent = running ? 'RUNNING' : 'STOPPED';
+    $('runBadge').className = 'badge ' + (running ? 'on' : 'off');
+    $('modeBadge').textContent = mode;
+    $('modeBadge').className = 'badge ' + (mode === 'LIVE' ? 'live' : 'paper');
+    const btn = $('btnToggle');
+    btn.textContent = running ? '■ Stop' : '▶ Start';
+    btn.className = running ? 'stop' : 'start';
+    const block = s.bn_block || '';
+    const banner = $('bnBlock');
+    banner.hidden = !block;
+    banner.textContent = block;
+
+    const prices = s.prices || {};
+    const slug = prices.slug || '';
+    const end = prices.market_end;
+    let meta = slug;
+    if (end) meta += ' · end ' + new Date(end * 1000).toLocaleTimeString();
+    $('slugLine').textContent = meta || '—';
+
+    const bn = prices.pf || prices.predict || prices.bn || prices.binance || {};
+    const pm = prices.pm || prices.polymarket || {};
+    $('bnUpBid').textContent = fmt(bn.up_bid);
+    $('bnUpAsk').textContent = fmt(bn.up_ask);
+    $('bnDownBid').textContent = fmt(bn.down_bid);
+    $('bnDownAsk').textContent = fmt(bn.down_ask);
+    $('pfBal').textContent = money(s.balances && (s.balances.predict || s.balances.binance));
+    $('bnAge').textContent = ageText(prices.bn_age);
+
+    $('pmUpBid').textContent = fmt(pm.up_bid);
+    $('pmUpAsk').textContent = fmt(pm.up_ask);
+    $('pmDownBid').textContent = fmt(pm.down_bid);
+    $('pmDownAsk').textContent = fmt(pm.down_ask);
+    $('pmBal').textContent = money(s.balances && s.balances.polymarket);
+    $('pmAge').textContent = ageText(prices.pm_age);
+
+    const tl = Math.max(0, Math.floor(prices.time_left || 0));
+    $('timeLeft').textContent = tl + 's';
+    const st = s.settings || {};
+    if (st.entry_sum_max != null) $('entryMax').textContent = fmt(st.entry_sum_max, 2);
+    if (st.exit_sum_min != null) $('exitMin').textContent = fmt(st.exit_sum_min, 2);
+    $('pnl').textContent = money(s.realized_pnl);
+    $('totalBal').textContent = money(s.balances && s.balances.total);
+    const rec = s.recovery || {};
+    $('recShares').textContent = rec.current_shares != null
+      ? `${Number(rec.current_shares).toFixed(0)} sh`
+      : '—';
+    $('recDebt').textContent = rec.recovery_debt != null ? money(rec.recovery_debt) : '—';
+
+    const hedges = s.open_hedges || [];
+    const oh = $('openBody');
+    if (!hedges.length) {
+      oh.innerHTML = '<tr><td colspan="5" class="muted">none</td></tr>';
+    } else {
+      oh.innerHTML = hedges.map(h => {
+        return `<tr><td>${marketLabel(h)}</td><td>${h.status||''}</td><td>${legHtml(h.bn, false)}</td><td>${legHtml(h.pm, false)}</td><td>${fmt(h.entry_sum,3)}</td></tr>`;
+      }).join('');
+    }
+
+    const hist = s.history || [];
+    const hb = $('histBody');
+    if (!hist.length) {
+      hb.innerHTML = '<tr><td colspan="5" class="muted">—</td></tr>';
+    } else {
+      hb.innerHTML = hist.slice(-25).reverse().map(h => {
+        const pnl = Number(h.pnl || 0);
+        const why = h.close_reason ? `<div class="muted">${h.close_reason}</div>` : '';
+        return `<tr><td>${marketLabel(h)}${why}</td><td>${legHtml(h.pm, true)}</td><td>${legHtml(h.bn, true)}</td><td>${fmt(h.entry_sum,3)} → ${fmt(h.exit_sum,3)}</td><td class="${pnl < 0 ? 'down' : 'up'}">${money(pnl)}</td></tr>`;
+      }).join('');
+    }
+
+    const logs = s.logs || [];
+    $('logs').textContent = logs.slice(-50).join('\n');
+  }
+
+  async function toggle() {
+    const running = $('runBadge').textContent === 'RUNNING';
+    await fetch(running ? '/api/stop' : '/api/start', { method: 'POST' });
+  }
+
+  async function testBuy() {
+    const ok = confirm('Купити на Predict.fun на $1 по поточному ринку? Це реальна угода для перевірки запиту, без Polymarket.');
+    if (!ok) return;
+    const btn = $('btnTest');
+    btn.disabled = true;
+    try {
+      const r = await fetch('/api/test-buy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ usd: 1 }),
+      });
+      const data = await r.json();
+      const status = data.status || (data.ok ? 'OK' : 'FAILED');
+      alert(data.reason ? status + ': ' + data.reason : status);
+    } catch (e) {
+      alert('Запит не дійшов до бота');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // WebSocket live feed (HTTP poll only if WS fails)
+  let httpFallback = false;
+  function connectWs() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(proto + '://' + location.host + '/ws/state');
+    ws.onmessage = (ev) => {
+      try { applyState(JSON.parse(ev.data)); } catch (e) {}
+    };
+    ws.onclose = () => {
+      if (!httpFallback) {
+        httpFallback = true;
+        setInterval(async () => {
+          try {
+            const r = await fetch('/api/state');
+            applyState(await r.json());
+          } catch (e) {}
+        }, 1000);
+      }
+      setTimeout(connectWs, 2500);
+    };
+    ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  }
+  connectWs();
+</script>
+</body></html>
