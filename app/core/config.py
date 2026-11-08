@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     # Predict.fun
     predict_api_key: str = ""
     predict_private_key: str = ""
+    # Predict smart wallet (deposit address from Settings) — required for web-app funded accounts
+    predict_account: str = ""
     predict_rest_base_url: str = "https://api.predict.fun"
     predict_wss_url: str = "wss://ws.predict.fun/ws"
     predict_chain_id: int = 56

@@ -78,6 +78,11 @@ class HedgeEngine:
         self._task: Optional[asyncio.Task] = None
         self._last_scan = 0.0
         self.last_error: str = ""
+        self._bal_pf: float | None = None
+        self._bal_pm: float | None = None
+        self._bal_ts: float = 0.0
+        self.pf_entry_cooldown_until: float = 0.0
+        self._last_entry_attempt: float = 0.0
         self.status_text: str = "idle"
         cfg = RecoveryConfig(
             base_shares=self.settings.base_shares,
@@ -152,6 +157,7 @@ class HedgeEngine:
         elif open_count < self.settings.max_open_hedges:
             block = self.recovery.entry_block()
             if not block:
+                await self._refresh_balances(now)
                 await self._try_entry(now)
             else:
                 self.status_text = block
@@ -295,7 +301,28 @@ class HedgeEngine:
 
     # ── entry ───────────────────────────────────────────────────
 
+    async def _refresh_balances(self, now: float) -> None:
+        if now - self._bal_ts < 30.0:
+            return
+        self._bal_ts = now
+        try:
+            self._bal_pf = await self.pf.get_collateral_balance()
+        except Exception:
+            pass
+        try:
+            if hasattr(self.pm, "get_collateral_balance"):
+                self._bal_pm = await self.pm.get_collateral_balance()
+        except Exception:
+            pass
+
     async def _try_entry(self, now: float) -> None:
+        # Don't spam LIVE rejects (e.g. geo 403)
+        if now < self.pf_entry_cooldown_until:
+            self.status_text = f"PF cooldown {int(self.pf_entry_cooldown_until - now)}s"
+            return
+        if now - self._last_entry_attempt < 8.0:
+            return
+        self._last_entry_attempt = now
         if not self.pm_market:
             return
         pm_end = float(self.pm_market.get("end") or 0)
@@ -414,7 +441,18 @@ class HedgeEngine:
         if pf_fill.status == "REJECTED":
             hedge.status = "CLOSED"
             hedge.closed_at = time.time()
+            reason = (pf_fill.reason or "").lower()
             logger.warning("PF reject %s — abort pair", pf_fill.reason)
+            if "jurisdiction" in reason or "403" in reason or "forbidden" in reason:
+                self.pf_entry_cooldown_until = now + 3600.0  # 1h — geo block
+                self.last_error = "Predict 403: not available in your jurisdiction"
+                logger.error(
+                    "Predict blocked by jurisdiction (403). "
+                    "LIVE orders will not work from this IP until you change network/VPN. "
+                    "Cooldown/WS still work; switch MODE=PAPER or use allowed region."
+                )
+            else:
+                self.pf_entry_cooldown_until = now + 30.0
             return
 
         filled = pf_fill.shares if pf_fill.shares > 0 else shares
@@ -786,6 +824,12 @@ class HedgeEngine:
             },
             "recovery": self.recovery.snapshot(),
             "realized_pnl": sum(h.pnl for h in self.hedges if h.status == "CLOSED"),
+            "balances": {
+                "predict": self._bal_pf,
+                "polymarket": self._bal_pm,
+                "total": (None if self._bal_pf is None and self._bal_pm is None
+                          else round((self._bal_pf or 0) + (self._bal_pm or 0), 4)),
+            },
             "prices": {
                 "slug": slug,
                 "market_end": market_end,

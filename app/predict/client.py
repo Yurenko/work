@@ -399,6 +399,47 @@ class PredictClient:
         return out
 
 
+    async def get_collateral_balance(self) -> float | None:
+        """USDT balance of trading wallet (EOA or PREDICT_ACCOUNT) on BNB Chain."""
+        try:
+            from eth_account import Account
+            from web3 import Web3
+        except ImportError:
+            return None
+        pk = (self.settings.predict_private_key or "").strip()
+        if not pk:
+            return None
+        if not pk.startswith("0x"):
+            pk = "0x" + pk
+        try:
+            eoa = Account.from_key(pk).address
+        except Exception:
+            return None
+        account = (getattr(self.settings, "predict_account", None) or "").strip()
+        addr = account or eoa
+        usdt = "0x55d398326f99059fF775485246999027B3197955"
+        rpc = "https://bsc-dataseed.binance.org"
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 8}))
+            abi = [{
+                "name": "balanceOf", "type": "function", "stateMutability": "view",
+                "inputs": [{"name": "a", "type": "address"}],
+                "outputs": [{"type": "uint256"}],
+            }, {
+                "name": "decimals", "type": "function", "stateMutability": "view",
+                "inputs": [], "outputs": [{"type": "uint8"}],
+            }]
+            contract = w3.eth.contract(address=Web3.to_checksum_address(usdt), abi=abi)
+            raw = contract.functions.balanceOf(Web3.to_checksum_address(addr)).call()
+            try:
+                dec = int(contract.functions.decimals().call())
+            except Exception:
+                dec = 18
+            return round(raw / (10 ** dec), 4)
+        except Exception as e:
+            logger.debug("PF balance fetch failed: %s", e)
+            return None
+
     async def place_order(
         self,
         market_id: str | int,
@@ -525,7 +566,42 @@ class PredictClient:
         price_wei = int(round(price * 1e18))
         qty_wei = int(round(shares * 1e18))
 
-        builder = OrderBuilder.make(ChainId.BNB_MAINNET, pk)
+        # If user funds via predict.fun UI, money sits on Predict Account (smart wallet).
+        # Privy-exported key only signs; maker/signer must be the account address.
+        predict_account = (getattr(self.settings, "predict_account", None) or "").strip()
+        try:
+            from predict_sdk import OrderBuilderOptions
+        except ImportError:
+            OrderBuilderOptions = None  # type: ignore
+
+        if predict_account and OrderBuilderOptions is not None:
+            builder = OrderBuilder.make(
+                ChainId.BNB_MAINNET,
+                pk,
+                OrderBuilderOptions(predict_account=predict_account),
+            )
+            logger.info("Predict order via smart account %s", predict_account)
+        elif predict_account:
+            # older sdk kwargs style
+            try:
+                builder = OrderBuilder.make(
+                    ChainId.BNB_MAINNET, pk, predict_account=predict_account
+                )
+            except TypeError:
+                builder = OrderBuilder.make(ChainId.BNB_MAINNET, pk)
+                logger.warning(
+                    "SDK does not accept predict_account — upgrade predict-sdk. "
+                    "Orders may fail if funds are on smart wallet."
+                )
+            else:
+                logger.info("Predict order via smart account %s", predict_account)
+        else:
+            builder = OrderBuilder.make(ChainId.BNB_MAINNET, pk)
+            logger.warning(
+                "PREDICT_ACCOUNT not set — using EOA. "
+                "If Portfolio is funded on predict.fun UI, set PREDICT_ACCOUNT to deposit address."
+            )
+
         sdk_side = SdkSide.BUY if side == "BUY" else SdkSide.SELL
 
         amounts = builder.get_limit_order_amounts(

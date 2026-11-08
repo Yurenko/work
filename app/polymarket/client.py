@@ -311,8 +311,37 @@ class PolymarketClient:
             funder=funder,
         )
         try:
-            creds = client.create_or_derive_api_creds()
-            client.set_api_creds(creds)
+            creds = None
+            for name in (
+                "create_or_derive_api_key",
+                "create_or_derive_api_creds",
+                "createOrDeriveApiKey",
+                "derive_api_key",
+                "create_api_key",
+            ):
+                fn = getattr(client, name, None)
+                if callable(fn):
+                    creds = fn()
+                    logger.info("PM api creds via %s", name)
+                    break
+            if creds is None:
+                raise AttributeError(
+                    "ClobClient has no create_or_derive_api_key/creds — upgrade py-clob-client-v2"
+                )
+            if hasattr(client, "set_api_creds"):
+                client.set_api_creds(creds)
+            elif hasattr(client, "set_creds"):
+                client.set_creds(creds)
+            else:
+                # v2 often takes creds in constructor — rebuild
+                client = ClobClient(
+                    host,
+                    key=key,
+                    chain_id=chain_id,
+                    signature_type=sig_type,
+                    funder=funder,
+                    creds=creds,
+                )
             logger.info("PM api creds ready")
         except Exception as e:
             logger.warning("PM api creds: %s", e)
@@ -397,6 +426,53 @@ class PolymarketClient:
         except Exception as e:
             logger.warning("PM LIVE %s rejected: %s", side, e)
             return {"status": "REJECTED", "reason": str(e)}
+
+    async def get_collateral_balance(self) -> float | None:
+        """USDC collateral available on Polymarket CLOB (LIVE only)."""
+        try:
+            clob = self._ensure_clob()
+        except Exception:
+            return None
+        if clob is None:
+            return None
+        try:
+            # py-clob-client variants
+            ba = None
+            # v2: get_balance_allowance(BalanceAllowanceParams)
+            try:
+                from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            except Exception:
+                try:
+                    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                except Exception:
+                    params = {"asset_type": "COLLATERAL"}
+            if hasattr(clob, "get_balance_allowance"):
+                try:
+                    ba = clob.get_balance_allowance(params)
+                except TypeError:
+                    ba = clob.get_balance_allowance(params=params)
+            elif hasattr(clob, "getBalanceAllowance"):
+                ba = clob.getBalanceAllowance(params)
+            else:
+                return None
+            if isinstance(ba, dict):
+                bal = ba.get("balance") or ba.get("balanceAllowance") or ba.get("available")
+                if bal is not None:
+                    # often in micro USDC (6 decimals) as string
+                    v = float(bal)
+                    if v > 1e6:
+                        v = v / 1e6
+                    return round(v, 4)
+            if isinstance(ba, (int, float, str)):
+                v = float(ba)
+                if v > 1e6:
+                    v = v / 1e6
+                return round(v, 4)
+        except Exception:
+            return None
+        return None
 
     async def get_order(self, order_id: str) -> Optional[dict]:
         if not self.settings.is_live:

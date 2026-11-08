@@ -74,4 +74,19 @@ hedge-bot-predict/
 
 - На Predict один market = Yes (Up); Down рахується як complement — як раніше на Binance Prediction.
 - У PAPER ключ Predict бажаний для market data WS/REST на mainnet (без ключа handshake може дати 401).
-- Testnet: `https://api-testnet.predict.fun` — API key не обовʼязковий.
+- Testnet: `https://api-testnet.predict.fun` — API key не обовʼязковий.\n
+
+## LIVE setup (Predict.fun)
+
+1. Put USDT + a little BNB on the wallet (BNB Chain).
+2. Check balances:
+   ```bash
+   python scripts/check_balances.py
+   ```
+3. One-time approvals (USDT allowance for exchange):
+   ```bash
+   python scripts/set_approvals.py
+   ```
+4. Start bot with `MODE=LIVE`.
+
+Error `create_order_insufficient_collateral_allowance` means step 3 was skipped.
