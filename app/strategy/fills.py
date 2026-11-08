@@ -32,17 +32,26 @@ class Fill:
 def fill_from_predict(resp: Any, requested: float = 0.0) -> Fill:
     if not isinstance(resp, dict):
         return Fill(status="REJECTED", reason="empty response")
-    status = str(resp.get("status") or "").upper()
-    shares = _num(resp.get("filledShares") or resp.get("filled") or resp.get("quantityFilled")) or 0.0
-    price = _num(resp.get("avgPrice") or resp.get("price")) or 0.0
-    oid = str(resp.get("orderId") or resp.get("orderID") or resp.get("id") or "")
-    reason = str(resp.get("reason") or resp.get("error") or "")
+    # Unwrap nested data if present
+    if "orderId" not in resp and isinstance(resp.get("data"), dict):
+        resp = {**resp, **resp["data"]}
+    status = str(resp.get("status") or resp.get("state") or "").upper()
+    code = str(resp.get("code") or "").upper()
+    shares = _num(resp.get("filledShares") or resp.get("filled") or resp.get("quantityFilled") or resp.get("amountFilled")) or 0.0
+    price = _num(resp.get("avgPrice") or resp.get("price") or resp.get("entry_price")) or 0.0
+    oid = str(resp.get("orderId") or resp.get("orderID") or resp.get("id") or resp.get("orderHash") or "")
+    reason = str(resp.get("reason") or resp.get("error") or resp.get("message") or "")
     if status in ("FILLED", "MATCHED", "COMPLETE", "COMPLETED"):
         if shares <= 0:
             shares = requested
-        return Fill(status="FILLED", shares=shares, price=price, usd=round(shares * price, 4), order_id=oid)
+        return Fill(status="FILLED", shares=shares, price=price, usd=round(shares * (price or 0), 4), order_id=oid)
     if status in ("REJECTED", "FAILED", "CANCELLED", "CANCELED"):
         return Fill(status="REJECTED", reason=reason or status, order_id=oid)
+    # POST /v1/orders 201 → {code, orderId, orderHash} with no fill yet
+    if oid and (code in ("OK", "SUCCESS", "") or status in ("", "OPEN", "LIVE", "SUBMITTED", "ACCEPTED")):
+        return Fill(status="SUBMITTED", shares=shares, price=price, order_id=oid, reason=reason)
+    if not oid and reason:
+        return Fill(status="REJECTED", reason=reason)
     return Fill(status="SUBMITTED", shares=shares, price=price, order_id=oid, reason=reason)
 
 

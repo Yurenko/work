@@ -761,16 +761,23 @@ class PredictClient:
     def _normalize_order_resp(self, data: Any, shares: float, price: float) -> dict:
         if not isinstance(data, dict):
             return {"status": "SUBMITTED", "raw": data, "filledShares": 0.0, "avgPrice": price}
-        status = str(data.get("status") or data.get("state") or "SUBMITTED").upper()
-        filled = _num(data.get("filledShares") or data.get("filled") or data.get("quantityFilled")) or 0.0
+        # create-order returns {code, orderId, orderHash} under data (already unwrapped)
+        status = str(data.get("status") or data.get("state") or "").upper()
+        code = str(data.get("code") or "").upper()
+        filled = _num(data.get("filledShares") or data.get("filled") or data.get("quantityFilled") or data.get("amountFilled")) or 0.0
         avg = _num(data.get("avgPrice") or data.get("price")) or price
-        oid = str(data.get("id") or data.get("orderId") or data.get("order_id") or "")
+        oid = str(data.get("id") or data.get("orderId") or data.get("order_id") or data.get("orderHash") or "")
         if status in ("FILLED", "MATCHED", "COMPLETE", "COMPLETED") or filled >= shares * 0.99:
             status = "FILLED"
             if filled <= 0:
                 filled = shares
         elif status in ("REJECTED", "FAILED", "CANCELLED", "CANCELED"):
             status = "REJECTED"
+        elif oid and (code in ("OK", "SUCCESS", "") or status in ("", "OPEN", "LIVE", "ACCEPTED", "SUBMITTED")):
+            # accepted by API — not necessarily filled yet
+            status = "SUBMITTED"
+        elif not status:
+            status = "SUBMITTED" if oid else "REJECTED"
         return {
             "status": status,
             "orderId": oid,
@@ -779,6 +786,54 @@ class PredictClient:
             "usd": round(filled * avg, 4),
             "raw": data,
         }
+
+
+    async def wait_order_fill(
+        self, order_id: str, shares: float, price: float, timeout: float = 8.0
+    ) -> dict:
+        """Poll GET /v1/orders/{id} until FILLED/CANCELLED or timeout."""
+        import asyncio as _asyncio
+        if not order_id:
+            return {"status": "REJECTED", "reason": "no order id", "filledShares": 0.0, "avgPrice": price}
+        deadline = time.time() + timeout
+        last = {"status": "SUBMITTED", "orderId": order_id, "filledShares": 0.0, "avgPrice": price}
+        while time.time() < deadline:
+            data = await self._request("GET", f"/v1/orders/{order_id}", with_jwt=True)
+            if isinstance(data, dict):
+                # list endpoint may return object with status OPEN/FILLED
+                st = str(data.get("status") or "").upper()
+                amt = _num(data.get("amountFilled") or data.get("filledShares") or data.get("amount")) or 0.0
+                # amount fields sometimes in wei-ish strings — if >> shares treat as shares already
+                if amt > shares * 10:
+                    try:
+                        amt = float(amt) / 1e18
+                    except Exception:
+                        pass
+                last = {
+                    "status": st or "SUBMITTED",
+                    "orderId": order_id,
+                    "filledShares": amt,
+                    "avgPrice": price,
+                    "raw": data,
+                }
+                if st in ("FILLED", "MATCHED", "COMPLETE", "COMPLETED"):
+                    if amt <= 0:
+                        amt = shares
+                    last["status"] = "FILLED"
+                    last["filledShares"] = amt
+                    return last
+                if st in ("CANCELLED", "CANCELED", "REJECTED", "FAILED", "EXPIRED"):
+                    last["status"] = "REJECTED"
+                    last["reason"] = st
+                    return last
+                # OPEN with partial fill
+                if amt >= shares * 0.95:
+                    last["status"] = "FILLED"
+                    last["filledShares"] = amt
+                    return last
+            await _asyncio.sleep(0.6)
+        return last
+
 
     async def cancel_order(self, order_id: str) -> bool:
         if not self.settings.is_live:

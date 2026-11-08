@@ -436,6 +436,29 @@ class HedgeEngine:
             is_yes=(pf_dir == "up"),
         )
         pf_fill = fill_from_predict(pf_resp, shares)
+
+        # Predict POST /orders often returns SUBMITTED (201) before match — wait briefly
+        if pf_fill.status == "SUBMITTED" and pf_fill.order_id and self.settings.is_live:
+            logger.info("PF order %s submitted — waiting for fill…", pf_fill.order_id[:16])
+            # use limit price from original place response / leg
+            lim_px = float((pf_resp or {}).get("avgPrice") or hedge.pf_leg.entry_price or 0) or 0.5
+            polled = await self.pf.wait_order_fill(pf_fill.order_id, shares, lim_px, timeout=10.0)
+            if str(polled.get("status") or "").upper() == "FILLED":
+                px = float(polled.get("avgPrice") or lim_px or 0) or lim_px
+                sh = float(polled.get("filledShares") or shares)
+                pf_fill = Fill(status="FILLED", shares=sh, price=px, usd=round(sh * px, 4), order_id=pf_fill.order_id)
+                logger.info("PF order filled shares=%.4f @ %.4f", sh, px)
+            elif polled.get("status") == "REJECTED":
+                pf_fill = Fill(status="REJECTED", reason=polled.get("reason") or "cancelled", order_id=pf_fill.order_id)
+            else:
+                # still open — treat as risky; try cancel and abort to avoid naked PM
+                logger.warning("PF order still open after wait — aborting pair (no PM leg)")
+                try:
+                    await self.pf.cancel_order(pf_fill.order_id)
+                except Exception:
+                    pass
+                pf_fill = Fill(status="REJECTED", reason="not filled in time", order_id=pf_fill.order_id)
+
         self._apply_fill(hedge.pf_leg, pf_fill)
 
         if pf_fill.status == "REJECTED":
@@ -451,10 +474,14 @@ class HedgeEngine:
                     "LIVE orders will not work from this IP until you change network/VPN. "
                     "Cooldown/WS still work; switch MODE=PAPER or use allowed region."
                 )
+            elif "insufficient" in reason or "collateral" in reason or "balance" in reason:
+                self.pf_entry_cooldown_until = now + 120.0
+                self.last_error = "Predict insufficient USDT balance/allowance"
             else:
-                self.pf_entry_cooldown_until = now + 30.0
+                self.pf_entry_cooldown_until = now + 15.0
             return
 
+        # Only size PM to confirmed PF fill
         filled = pf_fill.shares if pf_fill.shares > 0 else shares
         # 2) Polymarket for the filled size
         pm_resp = await self.pm.place_market_buy(str(pm_token), filled, pm_ask)
