@@ -114,20 +114,16 @@ class PredictClient:
     # ── Auth (JWT) ──────────────────────────────────────────────
 
     async def ensure_jwt(self) -> Optional[str]:
-        """Fetch / refresh JWT using private key signature.
+        """Fetch / refresh JWT.
 
-        Uses eth_account when available. If private_key is empty or signing
-        fails, returns None (public endpoints still work).
+        EOA: sign auth message with eth_account (signer = EOA address).
+        Predict Account: sign via SDK sign_predict_account_message
+        (signer = PREDICT_ACCOUNT address). Plain EOA JWT cannot place
+        orders for a smart-wallet account.
         """
         if self._jwt and time.time() < self._jwt_exp - 60:
             return self._jwt
         if not self.private_key:
-            return None
-        try:
-            from eth_account import Account
-            from eth_account.messages import encode_defunct
-        except ImportError:
-            logger.warning("eth_account not installed — cannot obtain JWT")
             return None
 
         msg_data = await self._request("GET", "/v1/auth/message")
@@ -136,23 +132,83 @@ class PredictClient:
         message = msg_data.get("message") if isinstance(msg_data, dict) else None
         if not message:
             message = str(msg_data)
+
+        pk = self.private_key.strip()
+        if not pk.startswith("0x"):
+            pk = "0x" + pk
+        predict_account = (getattr(self.settings, "predict_account", None) or "").strip()
+
         try:
-            acct = Account.from_key(self.private_key)
-            signed = acct.sign_message(encode_defunct(text=message))
-            body = {
-                "signer": acct.address,
-                "signature": signed.signature.hex(),
-                "message": message,
-            }
+            if predict_account:
+                # Smart wallet path — required when funds are on Predict Account
+                from predict_sdk import OrderBuilder, ChainId
+                try:
+                    from predict_sdk import OrderBuilderOptions
+                    builder = OrderBuilder.make(
+                        ChainId.BNB_MAINNET, pk, OrderBuilderOptions(predict_account=predict_account)
+                    )
+                except Exception:
+                    try:
+                        builder = OrderBuilder.make(
+                            ChainId.BNB_MAINNET, pk, predict_account=predict_account
+                        )
+                    except TypeError:
+                        chain = getattr(ChainId, "BNB_MAINNET", None) or getattr(ChainId, "BnbMainnet")
+                        builder = OrderBuilder.make(chain, pk, predict_account=predict_account)
+
+                sig = None
+                for name in (
+                    "sign_predict_account_message",
+                    "signPredictAccountMessage",
+                    "sign_predict_account_message_async",
+                ):
+                    fn = getattr(builder, name, None)
+                    if callable(fn):
+                        sig = fn(message)
+                        # await if coroutine
+                        if hasattr(sig, "__await__"):
+                            sig = await sig
+                        break
+                if not sig:
+                    raise RuntimeError(
+                        "SDK missing sign_predict_account_message — upgrade predict-sdk"
+                    )
+                if isinstance(sig, bytes):
+                    signature = "0x" + sig.hex()
+                else:
+                    signature = str(sig)
+                    if not signature.startswith("0x"):
+                        signature = "0x" + signature
+                body = {
+                    "signer": predict_account,
+                    "signature": signature,
+                    "message": message,
+                }
+                signer_log = predict_account
+            else:
+                from eth_account import Account
+                from eth_account.messages import encode_defunct
+
+                acct = Account.from_key(pk)
+                signed = acct.sign_message(encode_defunct(text=message))
+                sig_hex = signed.signature.hex()
+                if not sig_hex.startswith("0x"):
+                    sig_hex = "0x" + sig_hex
+                body = {
+                    "signer": acct.address,
+                    "signature": sig_hex,
+                    "message": message,
+                }
+                signer_log = acct.address
+
             token_data = await self._request("POST", "/v1/auth", json_body=body)
             if not token_data:
                 return None
             token = token_data.get("token") if isinstance(token_data, dict) else None
             if token:
                 self._jwt = token
-                # JWT typically lasts hours; refresh conservatively
                 self._jwt_exp = time.time() + 3600
-                logger.info("Predict JWT obtained for %s", acct.address)
+                logger.info("Predict JWT obtained for %s", signer_log)
             return self._jwt
         except Exception as e:
             logger.warning("Predict JWT error: %s", e)

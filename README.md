@@ -90,3 +90,24 @@ hedge-bot-predict/
 4. Start bot with `MODE=LIVE`.
 
 Error `create_order_insufficient_collateral_allowance` means step 3 was skipped.
+
+## Run as systemd service (AWS / VPS)
+
+So the bot keeps running after you close SSH:
+
+```bash
+cd ~/work   # or your project path
+# venv + deps already set up, .env in place
+
+chmod +x deploy/install-systemd.sh
+sudo APP_DIR="$PWD" ./deploy/install-systemd.sh
+```
+
+Useful commands:
+
+```bash
+sudo systemctl status hedge-bot
+sudo systemctl restart hedge-bot
+sudo systemctl stop hedge-bot
+journalctl -u hedge-bot -f
+```
