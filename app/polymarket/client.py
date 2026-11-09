@@ -403,8 +403,14 @@ class PolymarketClient:
         try:
             args = OrderArgs(token_id=token_id, price=px, size=sz, side=order_side)
             signed = client.create_order(args)
-            resp = client.post_order(signed, OrderType.GTC)
-            logger.info("PM LIVE %s resp=%s", side, resp)
+            # Prefer FOK so we don't leave resting orders that later fill as a 2nd leg
+            order_type = getattr(OrderType, "FOK", None) or getattr(OrderType, "FAK", None) or OrderType.GTC
+            try:
+                resp = client.post_order(signed, order_type)
+            except Exception as e1:
+                logger.warning("PM post_order %s failed (%s) — fallback GTC", order_type, e1)
+                resp = client.post_order(signed, OrderType.GTC)
+            logger.info("PM LIVE %s type=%s resp=%s", side, order_type, resp)
             if not resp or (isinstance(resp, dict) and resp.get("error")):
                 reason = (resp or {}).get("error") if isinstance(resp, dict) else "rejected"
                 return {"status": "REJECTED", "reason": str(reason)}
@@ -412,11 +418,18 @@ class PolymarketClient:
             if isinstance(resp, dict):
                 oid = str(resp.get("orderID") or resp.get("id") or "")
                 status = str(resp.get("status") or "SUBMITTED").upper()
+                filled = _f(resp.get("size_matched") or resp.get("takingAmount") or resp.get("filled")) or 0.0
                 if status in ("MATCHED", "FILLED"):
                     status = "FILLED"
-                filled = _f(resp.get("size_matched") or resp.get("filled")) or (sz if status == "FILLED" else 0.0)
+                    if filled <= 0:
+                        filled = sz
+                elif status == "LIVE":
+                    # Resting — do NOT treat as filled; caller must cancel before retry
+                    status = "SUBMITTED"
+                    if filled <= 0:
+                        filled = 0.0
                 return {
-                    "status": status if status != "LIVE" else "SUBMITTED",
+                    "status": status,
                     "orderID": oid,
                     "filledShares": filled,
                     "avgPrice": px,
@@ -426,6 +439,28 @@ class PolymarketClient:
         except Exception as e:
             logger.warning("PM LIVE %s rejected: %s", side, e)
             return {"status": "REJECTED", "reason": str(e)}
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel a resting CLOB order so retry does not double size."""
+        if not order_id:
+            return False
+        try:
+            clob = self._ensure_clob()
+            if clob is None:
+                return False
+            for name in ("cancel", "cancel_order", "cancelOrder"):
+                fn = getattr(clob, name, None)
+                if callable(fn):
+                    try:
+                        res = fn(order_id)
+                    except TypeError:
+                        res = fn(order_id=order_id)
+                    logger.info("PM cancel %s → %s", order_id[:18], res)
+                    return True
+            logger.warning("PM cancel: no cancel method on ClobClient")
+        except Exception as e:
+            logger.warning("PM cancel %s failed: %s", order_id[:18], e)
+        return False
 
     async def get_collateral_balance(self) -> float | None:
         """USDC collateral available on Polymarket CLOB (LIVE only)."""

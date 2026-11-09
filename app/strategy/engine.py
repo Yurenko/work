@@ -486,10 +486,34 @@ class HedgeEngine:
 
         # Only size PM to confirmed PF fill
         filled = pf_fill.shares if pf_fill.shares > 0 else shares
-        # 2) Polymarket for the filled size
+        # 2) Polymarket for the filled size (FOK preferred — see client)
         pm_resp = await self.pm.place_market_buy(str(pm_token), filled, pm_ask)
         pm_fill = fill_from_pm_order(pm_resp, filled)
         self._apply_fill(hedge.pm_leg, pm_fill)
+
+        # If PM only resting (LIVE/SUBMITTED), cancel immediately — never leave open size
+        # that a retry would double.
+        if pm_fill.status == "SUBMITTED" and pm_fill.order_id:
+            logger.warning(
+                "PM order %s not filled (resting) — cancel, mark REJECTED to avoid double size",
+                pm_fill.order_id[:18],
+            )
+            try:
+                await self.pm.cancel_order(pm_fill.order_id)
+            except Exception:
+                pass
+            # one aggressive retry at a slightly worse price
+            worse = min(0.99, round(float(pm_ask) + 0.02, 2))
+            pm_resp2 = await self.pm.place_market_buy(str(pm_token), filled, worse)
+            pm_fill = fill_from_pm_order(pm_resp2, filled)
+            self._apply_fill(hedge.pm_leg, pm_fill)
+            if pm_fill.status == "SUBMITTED" and pm_fill.order_id:
+                try:
+                    await self.pm.cancel_order(pm_fill.order_id)
+                except Exception:
+                    pass
+                pm_fill = Fill(status="REJECTED", reason="PM resting after retry", order_id=pm_fill.order_id)
+                self._apply_fill(hedge.pm_leg, pm_fill)
 
         if pf_fill.status == "FILLED" and pm_fill.status == "FILLED":
             hedge.status = "OPEN"
@@ -557,8 +581,22 @@ class HedgeEngine:
             _, ask = self._pm_best(hedge.pm_leg.direction)
             size = hedge.pf_leg.filled_shares or hedge.pf_leg.requested_shares
             if ask and size > 0:
+                # Cancel any previous resting PM order first
+                if hedge.pm_leg.order_id and hedge.pm_leg.status == "SUBMITTED":
+                    try:
+                        await self.pm.cancel_order(hedge.pm_leg.order_id)
+                        logger.info("PM cancel before retry %s", hedge.pm_leg.order_id[:18])
+                    except Exception as e:
+                        logger.warning("PM cancel before retry: %s", e)
                 resp = await self.pm.place_market_buy(hedge.pm_leg.token_or_market, size, ask)
-                self._apply_fill(hedge.pm_leg, fill_from_pm_order(resp, size))
+                fill = fill_from_pm_order(resp, size)
+                if fill.status == "SUBMITTED" and fill.order_id:
+                    try:
+                        await self.pm.cancel_order(fill.order_id)
+                    except Exception:
+                        pass
+                    fill = Fill(status="REJECTED", reason="PM resting on retry", order_id=fill.order_id)
+                self._apply_fill(hedge.pm_leg, fill)
 
         if hedge.pf_leg.status == "FILLED" and hedge.pm_leg.status == "FILLED":
             hedge.status = "OPEN"
