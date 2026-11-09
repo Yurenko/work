@@ -496,31 +496,50 @@ class HedgeEngine:
 
         self._apply_fill(hedge.pf_leg, pf_fill)
 
-        # Reconcile PF shares + avg cost from positions API (truth vs limit price)
+        # Reconcile PF shares + REAL avg cost (positions + activity priceExecuted)
         if pf_fill.status == "FILLED" and self.settings.is_live:
             try:
                 import asyncio as _asyncio
-                await _asyncio.sleep(0.6)  # let settlement land
-                pos = await self.pf.get_position_for_market(pf_m["id"])
-                if pos and pos.get("shares", 0) > 0:
-                    real_sh = float(pos["shares"])
-                    real_px = float(pos.get("avg_price") or 0)
-                    if real_px <= 0 and real_sh > 0 and pf_fill.usd > 0:
-                        real_px = pf_fill.usd / real_sh
-                    if real_px > 0:
-                        logger.info(
-                            "PF position reconcile market=%s shares=%.4f→%.4f avg=%.4f→%.4f",
-                            pf_m["id"], pf_fill.shares, real_sh, pf_fill.price, real_px,
-                        )
-                        pf_fill = Fill(
-                            status="FILLED",
-                            shares=round(real_sh, 4),
-                            price=round(real_px, 4),
-                            usd=round(real_sh * real_px, 4),
-                            order_id=pf_fill.order_id,
-                            order_hash=getattr(pf_fill, "order_hash", "") or "",
-                        )
-                        self._apply_fill(hedge.pf_leg, pf_fill)
+                lim = float(pf_fill.price or 0)
+                real_sh = float(pf_fill.shares or 0)
+                real_px = 0.0
+                for attempt in range(3):
+                    await _asyncio.sleep(0.5 + attempt * 0.4)
+                    pos = await self.pf.get_position_for_market(pf_m["id"])
+                    if pos and pos.get("shares", 0) > 0:
+                        real_sh = float(pos["shares"]) or real_sh
+                        ap = float(pos.get("avg_price") or 0)
+                        # positions sometimes lag with limit; only trust if clearly below limit
+                        if 0 < ap < 1.0 and (lim <= 0 or ap <= lim + 0.005):
+                            real_px = ap
+                    act = await self.pf.get_fill_price_from_activity(
+                        pf_m["id"], order_id=pf_fill.order_id or "", limit_price=lim,
+                    )
+                    if act and act.get("avg_price"):
+                        ap = float(act["avg_price"])
+                        if 0 < ap < 1.0 and (real_px <= 0 or ap < real_px):
+                            real_px = ap
+                        if act.get("shares") and float(act["shares"]) > 0.5:
+                            # activity amount is often gross before fee; keep position shares if present
+                            pass
+                    if real_px > 0 and (lim <= 0 or real_px < lim - 0.005 or attempt == 2):
+                        break
+                if real_px <= 0:
+                    real_px = float(pf_fill.price or 0)
+                if real_sh > 0 and real_px > 0:
+                    logger.info(
+                        "PF reconcile market=%s shares=%.4f→%.4f avg=%.4f→%.4f (limit was %.4f)",
+                        pf_m["id"], pf_fill.shares, real_sh, pf_fill.price, real_px, lim,
+                    )
+                    pf_fill = Fill(
+                        status="FILLED",
+                        shares=round(real_sh, 4),
+                        price=round(real_px, 4),
+                        usd=round(real_sh * real_px, 4),
+                        order_id=pf_fill.order_id,
+                        order_hash=getattr(pf_fill, "order_hash", "") or "",
+                    )
+                    self._apply_fill(hedge.pf_leg, pf_fill)
             except Exception as e:
                 logger.warning("PF position reconcile failed: %s", e)
 

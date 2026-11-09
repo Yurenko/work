@@ -509,7 +509,6 @@ class PredictClient:
         )
         if not isinstance(rows, list) or not rows:
             return None
-        # Prefer largest amount position in this market
         best = None
         best_amt = -1.0
         for row in rows:
@@ -532,15 +531,86 @@ class PredictClient:
             avg_f = float(avg) if avg is not None else 0.0
         except (TypeError, ValueError):
             avg_f = 0.0
-        # avg sometimes in wei-ish string already decimal USD per share (0-1)
         if avg_f > 1.5:
             avg_f = avg_f / 1e18
+        # Some responses put cost as total USD in value-like fields — derive if needed
+        if (avg_f <= 0 or avg_f >= 1.0) and best_amt > 0:
+            for k in ("costUsd", "cost", "totalCost", "valueUsd"):
+                try:
+                    v = float(best.get(k) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if v > 1.5:  # likely total notional
+                    cand = v / best_amt
+                    if 0 < cand < 1.0:
+                        avg_f = cand
+                        break
         return {
             "shares": round(best_amt, 4),
-            "avg_price": round(avg_f, 4) if avg_f > 0 else 0.0,
+            "avg_price": round(avg_f, 4) if 0 < avg_f < 1.5 else 0.0,
             "value_usd": best.get("valueUsd"),
             "raw": best,
         }
+
+    async def get_fill_price_from_activity(
+        self, market_id: str | int, order_id: str = "", limit_price: float = 0.0
+    ) -> dict | None:
+        """GET /v1/account/activity — real priceExecuted from MATCH_SUCCESS."""
+        data = await self._request(
+            "GET",
+            "/v1/account/activity",
+            params={"first": "30"},
+            with_jwt=True,
+        )
+        rows = data if isinstance(data, list) else (
+            (data or {}).get("data") if isinstance(data, dict) else None
+        )
+        if not isinstance(rows, list):
+            return None
+        mid = str(market_id)
+        best_px = None
+        best_sh = 0.0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or row.get("type") or "").upper()
+            if "MATCH" not in name and "FILL" not in name and name not in ("MATCH_SUCCESS", "FILLED"):
+                # still accept rows with priceExecuted
+                if row.get("priceExecuted") is None and row.get("price") is None:
+                    continue
+            m = row.get("market") if isinstance(row.get("market"), dict) else {}
+            rid = str(m.get("id") or row.get("marketId") or "")
+            if rid and rid != mid:
+                continue
+            raw_px = row.get("priceExecuted") or row.get("price")
+            if isinstance(row.get("order"), dict) and raw_px is None:
+                raw_px = row["order"].get("price")
+            try:
+                px = float(raw_px) if raw_px is not None else 0.0
+            except (TypeError, ValueError):
+                px = 0.0
+            if px > 1.5:
+                px = px / 1e18
+            if not (0 < px < 1.5):
+                continue
+            raw_sh = row.get("amountFilled") or row.get("amount") or 0
+            try:
+                sh = float(raw_sh)
+            except (TypeError, ValueError):
+                sh = 0.0
+            if sh > 1e12:
+                sh = sh / 1e18
+            # Prefer fill price strictly below our limit when limit was aggressive
+            if limit_price > 0 and px <= limit_price + 0.001:
+                if best_px is None or px < best_px:
+                    best_px = px
+                    best_sh = sh
+            elif best_px is None:
+                best_px = px
+                best_sh = sh
+        if best_px is None:
+            return None
+        return {"avg_price": round(best_px, 4), "shares": round(best_sh, 4) if best_sh > 0 else 0.0}
 
     async def place_order(
         self,
