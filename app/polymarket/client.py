@@ -403,43 +403,46 @@ class PolymarketClient:
         try:
             args = OrderArgs(token_id=token_id, price=px, size=sz, side=order_side)
             signed = client.create_order(args)
-            # Prefer FOK so we don't leave resting orders that later fill as a 2nd leg
-            # Prefer FOK/FAK so we never leave a resting order that can fill later + duplicate
-            order_type = getattr(OrderType, "FOK", None) or getattr(OrderType, "FAK", None)
-            if order_type is None:
-                order_type = OrderType.GTC
+            # FOK only — never leave resting GTC that can fill later + duplicate size.
+            # On FOK kill (no liquidity) return REJECTED; engine retries with a *new* signed order at worse price.
+            order_type = getattr(OrderType, "FOK", None) or getattr(OrderType, "FAK", None) or OrderType.GTC
             try:
                 resp = client.post_order(signed, order_type)
             except Exception as e1:
-                logger.warning("PM post_order %s failed (%s)", order_type, e1)
-                # Only fall back to GTC for BUY if FOK unsupported; caller must cancel if LIVE
-                try:
-                    resp = client.post_order(signed, OrderType.GTC)
-                except Exception as e2:
-                    return {"status": "REJECTED", "reason": str(e2)}
+                msg = str(e1)
+                logger.warning("PM post_order %s failed (%s)", order_type, msg)
+                # Do not re-post the same signature (→ "Duplicated")
+                return {"status": "REJECTED", "reason": msg, "avgPrice": px}
             logger.info("PM LIVE %s type=%s resp=%s", side, order_type, resp)
-            if not resp or (isinstance(resp, dict) and resp.get("error")):
-                reason = (resp or {}).get("error") if isinstance(resp, dict) else "rejected"
-                return {"status": "REJECTED", "reason": str(reason)}
-            oid = ""
+            if not resp or (isinstance(resp, dict) and (resp.get("error") or (resp.get("success") is False and resp.get("status") != "matched"))):
+                reason = ""
+                if isinstance(resp, dict):
+                    reason = str(resp.get("error") or resp.get("errorMsg") or "rejected")
+                return {"status": "REJECTED", "reason": reason or "rejected", "avgPrice": px}
             if isinstance(resp, dict):
                 oid = str(resp.get("orderID") or resp.get("id") or "")
                 status = str(resp.get("status") or "SUBMITTED").upper()
-                filled = _f(resp.get("size_matched") or resp.get("takingAmount") or resp.get("filled")) or 0.0
+                taking = _f(resp.get("takingAmount") or resp.get("size_matched") or resp.get("filled"))
+                making = _f(resp.get("makingAmount"))
+                filled = taking or 0.0
+                avg = px
+                if taking and taking > 0 and making and making > 0:
+                    avg = making / taking
                 if status in ("MATCHED", "FILLED"):
                     status = "FILLED"
                     if filled <= 0:
                         filled = sz
                 elif status == "LIVE":
-                    # Resting — do NOT treat as filled; caller must cancel before retry
                     status = "SUBMITTED"
-                    if filled <= 0:
-                        filled = 0.0
+                    filled = filled or 0.0
                 return {
                     "status": status,
                     "orderID": oid,
                     "filledShares": filled,
-                    "avgPrice": px,
+                    "takingAmount": taking,
+                    "makingAmount": making,
+                    "avgPrice": avg,
+                    "price": avg,
                     "raw": resp,
                 }
             return {"status": "SUBMITTED", "orderID": str(resp), "filledShares": 0.0, "avgPrice": px}
