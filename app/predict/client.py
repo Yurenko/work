@@ -830,15 +830,54 @@ class PredictClient:
                 amt = amt / 1e18
             oid = str(data.get("id") or order_id or "")
             oh = ""
-            if isinstance(data.get("order"), dict):
-                oh = str(data["order"].get("hash") or "")
+            order_obj = data.get("order") if isinstance(data.get("order"), dict) else {}
+            if order_obj:
+                oh = str(order_obj.get("hash") or "")
             oh = oh or str(data.get("orderHash") or order_hash or "")
+
+            # Real fill price (not the limit we submitted)
+            avg = None
+            for k in ("avgPrice", "averagePrice", "fillPrice", "executedPrice", "price"):
+                v = data.get(k)
+                if v is None and order_obj:
+                    v = order_obj.get(k)
+                try:
+                    if v is not None and float(v) > 0:
+                        avg = float(v)
+                        # wei price? (e.g. 490000000000000000 = 0.49)
+                        if avg > 1.5:
+                            avg = avg / 1e18
+                        if 0 < avg < 1.5:
+                            break
+                        avg = None
+                except (TypeError, ValueError):
+                    avg = None
+            # Derive from maker/taker amounts when available
+            if avg is None:
+                try:
+                    maker = float(data.get("makerAmount") or order_obj.get("makerAmount") or 0)
+                    taker = float(data.get("takerAmount") or order_obj.get("takerAmount") or 0)
+                    if maker > 1e12:  # wei
+                        maker /= 1e18
+                        taker /= 1e18
+                    # BUY: maker=USD, taker=shares → price = maker/taker
+                    if is_buy and taker > 0 and maker > 0:
+                        avg = maker / taker
+                    elif (not is_buy) and maker > 0 and taker > 0:
+                        avg = taker / maker  # SELL: maker=shares, taker=USD
+                    if avg is not None and not (0 < avg < 1.5):
+                        avg = None
+                except (TypeError, ValueError, ZeroDivisionError):
+                    avg = None
+            if avg is None:
+                avg = float(price) if price else 0.5
+
             out = {
                 "status": st or "SUBMITTED",
                 "orderId": oid,
                 "orderHash": oh,
                 "filledShares": amt,
-                "avgPrice": price,
+                "avgPrice": round(float(avg), 4),
                 "raw": data,
             }
             if st in ("FILLED", "MATCHED", "COMPLETE", "COMPLETED"):

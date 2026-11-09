@@ -692,28 +692,41 @@ class HedgeEngine:
         if leg.status == "CLOSED" or leg.filled_shares <= 0:
             leg.status = "CLOSED"
             return
+        # Sell slightly under tracked size — PF fee/rounding leaves balance < filled_shares
+        size = float(leg.filled_shares)
+        if leg.venue == "predict":
+            size = max(0.01, round(size * 0.97, 4))  # PF fee leaves ~2% less than tracked
         if leg.venue == "predict":
             bid, _ = self._pf_best(leg.token_or_market, leg.direction)
-            px = bid or max(0.01, leg.entry_price * 0.9)
+            # aggressive sell limit (cross book)
+            px = max(0.01, min(float(bid or 0.01), max(0.01, leg.entry_price * 0.9)))
+            if bid:
+                px = max(0.01, round(float(bid) - 0.02, 2))
             resp = await self.pf.place_order(
                 leg.token_or_market,
                 "SELL",
-                leg.filled_shares,
+                size,
                 px,
                 is_yes=(leg.direction == "up"),
             )
-            fill = fill_from_predict(resp, leg.filled_shares)
+            fill = fill_from_predict(resp, size)
         else:
             bid, _ = self._pm_best(leg.direction)
             px = bid or max(0.01, leg.entry_price * 0.9)
-            resp = await self.pm.place_market_sell(leg.token_or_market, leg.filled_shares, px)
-            fill = fill_from_pm_order(resp, leg.filled_shares)
+            resp = await self.pm.place_market_sell(leg.token_or_market, size, px)
+            fill = fill_from_pm_order(resp, size)
         if fill.status == "FILLED":
             leg.status = "CLOSED"
             leg.exit_price = fill.price
             leg.exit_usd = fill.usd
         elif fill.status == "REJECTED":
+            reason = (fill.reason or "").lower()
             logger.warning("%s sell rejected: %s", label, fill.reason)
+            # No shares left to sell → stop retrying, wait for SETTLE at window end
+            if "insufficient" in reason and "share" in reason:
+                leg.status = "CLOSED"
+                leg.exit_price = leg.exit_price or 0.0
+                logger.info("%s sell: insufficient shares — mark CLOSED, settle at end", label)
 
     async def _finish_exit(self, hedge: Hedge, now: float) -> None:
         # Throttle sell attempts (avoid 1Hz spam when market closed)
