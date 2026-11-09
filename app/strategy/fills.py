@@ -22,6 +22,7 @@ class Fill:
     price: float = 0.0
     usd: float = 0.0
     order_id: str = ""
+    order_hash: str = ""
     reason: str = ""
 
     @property
@@ -39,20 +40,21 @@ def fill_from_predict(resp: Any, requested: float = 0.0) -> Fill:
     code = str(resp.get("code") or "").upper()
     shares = _num(resp.get("filledShares") or resp.get("filled") or resp.get("quantityFilled") or resp.get("amountFilled")) or 0.0
     price = _num(resp.get("avgPrice") or resp.get("price") or resp.get("entry_price")) or 0.0
-    oid = str(resp.get("orderId") or resp.get("orderID") or resp.get("id") or resp.get("orderHash") or "")
+    oid = str(resp.get("orderId") or resp.get("orderID") or resp.get("id") or "")
+    ohash = str(resp.get("orderHash") or resp.get("hash") or "")
     reason = str(resp.get("reason") or resp.get("error") or resp.get("message") or "")
     if status in ("FILLED", "MATCHED", "COMPLETE", "COMPLETED"):
         if shares <= 0:
             shares = requested
-        return Fill(status="FILLED", shares=shares, price=price, usd=round(shares * (price or 0), 4), order_id=oid)
+        return Fill(status="FILLED", shares=shares, price=price, usd=round(shares * (price or 0), 4), order_id=oid, order_hash=ohash)
     if status in ("REJECTED", "FAILED", "CANCELLED", "CANCELED"):
-        return Fill(status="REJECTED", reason=reason or status, order_id=oid)
+        return Fill(status="REJECTED", reason=reason or status, order_id=oid, order_hash=ohash)
     # POST /v1/orders 201 → {code, orderId, orderHash} with no fill yet
     if oid and (code in ("OK", "SUCCESS", "") or status in ("", "OPEN", "LIVE", "SUBMITTED", "ACCEPTED")):
-        return Fill(status="SUBMITTED", shares=shares, price=price, order_id=oid, reason=reason)
+        return Fill(status="SUBMITTED", shares=shares, price=price, order_id=oid, order_hash=ohash, reason=reason)
     if not oid and reason:
         return Fill(status="REJECTED", reason=reason)
-    return Fill(status="SUBMITTED", shares=shares, price=price, order_id=oid, reason=reason)
+    return Fill(status="SUBMITTED", shares=shares, price=price, order_id=oid, order_hash=ohash, reason=reason)
 
 
 # Backwards-compatible aliases used by older tests / engine names
@@ -74,7 +76,7 @@ def fill_from_pm_order(resp: Any, requested: float = 0.0) -> Fill:
         return Fill(status="FILLED", shares=shares, price=price, usd=round(shares * price, 4), order_id=oid)
     if status in ("REJECTED", "FAILED"):
         return Fill(status="REJECTED", reason=reason or status, order_id=oid)
-    return Fill(status="SUBMITTED", shares=shares, price=price, order_id=oid, reason=reason)
+    return Fill(status="SUBMITTED", shares=shares, price=price, order_id=oid, order_hash=ohash, reason=reason)
 
 
 fill_from_polymarket = fill_from_pm_order

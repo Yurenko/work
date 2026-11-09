@@ -766,21 +766,22 @@ class PredictClient:
         code = str(data.get("code") or "").upper()
         filled = _num(data.get("filledShares") or data.get("filled") or data.get("quantityFilled") or data.get("amountFilled")) or 0.0
         avg = _num(data.get("avgPrice") or data.get("price")) or price
-        oid = str(data.get("id") or data.get("orderId") or data.get("order_id") or data.get("orderHash") or "")
+        oid = str(data.get("id") or data.get("orderId") or data.get("order_id") or "")
+        ohash = str(data.get("orderHash") or data.get("hash") or data.get("order_hash") or "")
         if status in ("FILLED", "MATCHED", "COMPLETE", "COMPLETED") or filled >= shares * 0.99:
             status = "FILLED"
             if filled <= 0:
                 filled = shares
         elif status in ("REJECTED", "FAILED", "CANCELLED", "CANCELED"):
             status = "REJECTED"
-        elif oid and (code in ("OK", "SUCCESS", "") or status in ("", "OPEN", "LIVE", "ACCEPTED", "SUBMITTED")):
-            # accepted by API — not necessarily filled yet
+        elif (oid or ohash) and (code in ("OK", "SUCCESS", "") or status in ("", "OPEN", "LIVE", "ACCEPTED", "SUBMITTED")):
             status = "SUBMITTED"
         elif not status:
-            status = "SUBMITTED" if oid else "REJECTED"
+            status = "SUBMITTED" if (oid or ohash) else "REJECTED"
         return {
             "status": status,
             "orderId": oid,
+            "orderHash": ohash,
             "filledShares": filled,
             "avgPrice": avg,
             "usd": round(filled * avg, 4),
@@ -789,58 +790,127 @@ class PredictClient:
 
 
     async def wait_order_fill(
-        self, order_id: str, shares: float, price: float, timeout: float = 8.0
+        self,
+        order_id: str,
+        shares: float,
+        price: float,
+        timeout: float = 12.0,
+        order_hash: str = "",
     ) -> dict:
-        """Poll GET /v1/orders/{id} until FILLED/CANCELLED or timeout."""
+        """Poll order status until FILLED/CANCELLED or timeout.
+
+        Docs: GET /v1/orders/{hash} — path is the order **hash**, not numeric id.
+        amountFilled is in wei (1e18). Brief 404 right after create is normal.
+        """
         import asyncio as _asyncio
-        if not order_id:
-            return {"status": "REJECTED", "reason": "no order id", "filledShares": 0.0, "avgPrice": price}
+
+        last = {
+            "status": "SUBMITTED",
+            "orderId": order_id or "",
+            "orderHash": order_hash or "",
+            "filledShares": 0.0,
+            "avgPrice": price,
+        }
+        if not order_hash and not order_id:
+            return {**last, "status": "REJECTED", "reason": "no order id/hash"}
+
         deadline = time.time() + timeout
-        last = {"status": "SUBMITTED", "orderId": order_id, "filledShares": 0.0, "avgPrice": price}
+
+        def _parse_order(data: dict) -> dict:
+            st = str(data.get("status") or "").upper()
+            raw_filled = data.get("amountFilled") or data.get("filledShares") or data.get("amount") or 0
+            try:
+                amt = float(raw_filled)
+            except (TypeError, ValueError):
+                amt = 0.0
+            # wei → shares
+            if amt > shares * 10:
+                amt = amt / 1e18
+            oid = str(data.get("id") or order_id or "")
+            oh = ""
+            if isinstance(data.get("order"), dict):
+                oh = str(data["order"].get("hash") or "")
+            oh = oh or str(data.get("orderHash") or order_hash or "")
+            out = {
+                "status": st or "SUBMITTED",
+                "orderId": oid,
+                "orderHash": oh,
+                "filledShares": amt,
+                "avgPrice": price,
+                "raw": data,
+            }
+            if st in ("FILLED", "MATCHED", "COMPLETE", "COMPLETED"):
+                out["status"] = "FILLED"
+                if out["filledShares"] <= 0:
+                    out["filledShares"] = shares
+            elif st in ("CANCELLED", "CANCELED", "REJECTED", "FAILED", "EXPIRED", "INVALIDATED"):
+                out["status"] = "REJECTED"
+                out["reason"] = st
+            elif out["filledShares"] >= shares * 0.95:
+                out["status"] = "FILLED"
+            return out
+
         while time.time() < deadline:
-            data = await self._request("GET", f"/v1/orders/{order_id}", with_jwt=True)
+            data = None
+            # Primary: by hash
+            if order_hash:
+                data = await self._request("GET", f"/v1/orders/{order_hash}", with_jwt=True)
+            # Fallback: list FILLED then OPEN and match id
+            if data is None:
+                for st_filter in ("FILLED", "OPEN"):
+                    page = await self._request(
+                        "GET",
+                        "/v1/orders",
+                        params={"status": st_filter, "first": "50"},
+                        with_jwt=True,
+                    )
+                    rows = page if isinstance(page, list) else (
+                        (page or {}).get("data") if isinstance(page, dict) else None
+                    )
+                    if not isinstance(rows, list):
+                        # _request already unwraps data sometimes — page may be list of orders
+                        if isinstance(page, dict) and isinstance(page.get("data"), list):
+                            rows = page["data"]
+                        else:
+                            rows = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        rid = str(row.get("id") or "")
+                        rhash = ""
+                        if isinstance(row.get("order"), dict):
+                            rhash = str(row["order"].get("hash") or "")
+                        rhash = rhash or str(row.get("orderHash") or "")
+                        if (order_id and rid == str(order_id)) or (
+                            order_hash and rhash.lower() == order_hash.lower()
+                        ):
+                            data = row
+                            break
+                    if data is not None:
+                        break
+
             if isinstance(data, dict):
-                # list endpoint may return object with status OPEN/FILLED
-                st = str(data.get("status") or "").upper()
-                amt = _num(data.get("amountFilled") or data.get("filledShares") or data.get("amount")) or 0.0
-                # amount fields sometimes in wei-ish strings — if >> shares treat as shares already
-                if amt > shares * 10:
-                    try:
-                        amt = float(amt) / 1e18
-                    except Exception:
-                        pass
-                last = {
-                    "status": st or "SUBMITTED",
-                    "orderId": order_id,
-                    "filledShares": amt,
-                    "avgPrice": price,
-                    "raw": data,
-                }
-                if st in ("FILLED", "MATCHED", "COMPLETE", "COMPLETED"):
-                    if amt <= 0:
-                        amt = shares
-                    last["status"] = "FILLED"
-                    last["filledShares"] = amt
+                last = _parse_order(data)
+                if last["status"] in ("FILLED", "REJECTED"):
                     return last
-                if st in ("CANCELLED", "CANCELED", "REJECTED", "FAILED", "EXPIRED"):
-                    last["status"] = "REJECTED"
-                    last["reason"] = st
-                    return last
-                # OPEN with partial fill
-                if amt >= shares * 0.95:
-                    last["status"] = "FILLED"
-                    last["filledShares"] = amt
-                    return last
-            await _asyncio.sleep(0.6)
+            await _asyncio.sleep(0.7)
         return last
 
-
-    async def cancel_order(self, order_id: str) -> bool:
-        if not self.settings.is_live:
-            return True
-        await self.ensure_jwt()
-        data = await self._request("DELETE", f"/v1/orders/{order_id}", with_jwt=True)
+    async def cancel_order(self, order_id: str, order_hash: str = "") -> bool:
+        """Remove order from book: POST /v1/orders/remove (not DELETE)."""
+        body = None
+        if order_id:
+            body = {"data": {"ids": [str(order_id)]}}
+            path = "/v1/orders/remove"
+        elif order_hash:
+            body = {"data": {"hashes": [str(order_hash)]}}
+            path = "/v1/orders/remove-by-hash"
+        else:
+            return False
+        data = await self._request("POST", path, json_body=body, with_jwt=True)
+        logger.info("PF cancel id=%s hash=%s → %s", order_id, (order_hash or "")[:16], data)
         return data is not None
+
 
     async def get_order(self, order_id: str) -> Optional[dict]:
         if not self.settings.is_live:
