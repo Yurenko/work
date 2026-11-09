@@ -42,7 +42,7 @@ def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float
     """Limit price and size for a BUY that CLOB will accept.
 
     CLOB: maker (USDC = size × price) max 2 decimals, taker (shares) max 4.
-    We pick integer USDC cents first, then derive size so size*limit has ≤2 decimals.
+    Marketable BUY requires min ~$1 notional — bump size if needed.
     """
     ask = float(ask)
     target = float(target_shares)
@@ -51,28 +51,36 @@ def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float
     limit = _floor_dec(ask, 2)
     if limit <= 0:
         return 0.0, 0.0
-    # max USDC we are willing to spend (2 decimals)
+
+    # Polymarket marketable BUY min size is $1.00 — raise shares if cheap tokens
+    MIN_USD = 1.05
+    min_shares_for_min_usd = MIN_USD / limit
+    if target < min_shares_for_min_usd:
+        target = min_shares_for_min_usd
+
+    # max USDC we are willing to spend (2 decimals), at least $1.05
     budget_cents = int(math.floor(target * limit * 100 + 1e-9))
-    if budget_cents < 1:
-        return limit, 0.0
+    if budget_cents < int(MIN_USD * 100):
+        budget_cents = int(math.ceil(MIN_USD * 100))
     usdc = budget_cents / 100.0
-    # size with 4 decimals such that size * limit <= usdc
+    # size with 4 decimals such that size * limit ≈ usdc
     size = _floor_dec(usdc / limit, 4)
     # re-quantize maker to exact cents
     for _ in range(8):
         maker_cents = int(math.floor(size * limit * 100 + 1e-9))
-        if maker_cents < 1:
-            return limit, 0.0
+        if maker_cents < int(MIN_USD * 100):
+            maker_cents = int(math.ceil(MIN_USD * 100))
+            size = _floor_dec((maker_cents / 100.0) / limit, 4)
+            continue
         maker = maker_cents / 100.0
         size2 = _floor_dec(maker / limit, 4)
         if abs(size2 - size) < 1e-12 and abs(size2 * limit - maker) < 1e-9:
             size = size2
             break
         size = size2
-    if size < 5.0 and target >= 5.0 and budget_cents >= int(math.ceil(5.0 * limit * 100 - 1e-9)):
-        size = _floor_dec(5.0, 4)
-        maker_cents = int(math.floor(size * limit * 100 + 1e-9))
-        size = _floor_dec((maker_cents / 100.0) / limit, 4)
+    # final guard
+    if size * limit < MIN_USD - 1e-9:
+        size = _floor_dec(MIN_USD / limit + 0.0001, 4)
     return limit, size
 
 

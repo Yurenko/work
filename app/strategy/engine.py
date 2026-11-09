@@ -678,7 +678,9 @@ class HedgeEngine:
                         logger.info("PM cancel before retry %s", hedge.pm_leg.order_id[:18])
                     except Exception as e:
                         logger.warning("PM cancel before retry: %s", e)
-                resp = await self.pm.place_market_buy(hedge.pm_leg.token_or_market, size, ask)
+                # bump limit so notional stays >= $1 even if ask is tiny
+                px = min(0.99, round(float(ask) + 0.03, 2))
+                resp = await self.pm.place_market_buy(hedge.pm_leg.token_or_market, size, px)
                 fill = fill_from_pm_order(resp, size)
                 if fill.status == "SUBMITTED" and fill.order_id:
                     try:
