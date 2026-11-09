@@ -432,43 +432,67 @@ class HedgeEngine:
         )
         self.hedges.append(hedge)
 
-        # 1) Predict first
+        # 1) Predict first — aggressive LIMIT (ask + slip) so it takes liquidity like a market buy.
+        # Order size is inflated by taker fee so *net* shares ≈ target after fee (~2%).
+        fee_bps = int(getattr(self, "_pf_fee_bps", 200) or 200)
+        fee_mult = 1.0 - fee_bps / 10000.0
+        order_shares = round(shares / fee_mult, 4) if fee_mult > 0 else shares
+        # Cross the book: pay up to +3¢ vs best ask (still limit, fills as taker when book has size)
+        pf_px = min(0.99, round(float(pf_ask) + 0.03, 2))
+        logger.info(
+            "PF BUY target_net=%.2f order_size=%.4f limit=%.2f (ask=%.2f +slip) fee_bps=%d",
+            shares, order_shares, pf_px, pf_ask, fee_bps,
+        )
         pf_resp = await self.pf.place_order(
             pf_m["id"],
             "BUY",
-            shares,
-            pf_ask,
+            order_shares,
+            pf_px,
             is_yes=(pf_dir == "up"),
         )
-        pf_fill = fill_from_predict(pf_resp, shares)
+        pf_fill = fill_from_predict(pf_resp, order_shares)
 
-        # Predict POST /orders often returns SUBMITTED (201) before match — wait briefly
+        # Predict POST /orders often returns SUBMITTED (201) before match — wait for fill
         if pf_fill.status == "SUBMITTED" and pf_fill.order_id and self.settings.is_live:
             logger.info("PF order %s submitted — waiting for fill…", pf_fill.order_id[:16])
-            # use limit price from original place response / leg
-            lim_px = float((pf_resp or {}).get("avgPrice") or hedge.pf_leg.entry_price or 0) or 0.5
+            lim_px = float((pf_resp or {}).get("avgPrice") or pf_px or 0) or 0.5
             polled = await self.pf.wait_order_fill(
-                pf_fill.order_id, shares, lim_px, timeout=12.0,
+                pf_fill.order_id, order_shares, lim_px, timeout=20.0,
                 order_hash=getattr(pf_fill, "order_hash", "") or "",
                 is_buy=True,
-                fee_bps=int(getattr(self, "_pf_fee_bps", 200) or 200),
+                fee_bps=fee_bps,
             )
-            if str(polled.get("status") or "").upper() == "FILLED":
+            st = str(polled.get("status") or "").upper()
+            sh = float(polled.get("filledShares") or 0)
+            if st == "FILLED" or sh > 0.5:
                 px = float(polled.get("avgPrice") or lim_px or 0) or lim_px
-                sh = float(polled.get("filledShares") or shares)
-                pf_fill = Fill(status="FILLED", shares=sh, price=px, usd=round(sh * px, 4), order_id=pf_fill.order_id, order_hash=getattr(pf_fill, "order_hash", "") or str(polled.get("orderHash") or ""))
-                logger.info("PF order filled shares=%.4f @ %.4f", sh, px)
-            elif polled.get("status") == "REJECTED":
+                if sh <= 0:
+                    sh = shares  # fallback target net
+                pf_fill = Fill(
+                    status="FILLED", shares=sh, price=px,
+                    usd=round(sh * px, 4),
+                    order_id=pf_fill.order_id,
+                    order_hash=getattr(pf_fill, "order_hash", "") or str(polled.get("orderHash") or ""),
+                )
+                logger.info("PF order filled net_shares=%.4f @ %.4f (target %.2f)", sh, px, shares)
+            elif st == "REJECTED":
                 pf_fill = Fill(status="REJECTED", reason=polled.get("reason") or "cancelled", order_id=pf_fill.order_id)
             else:
-                # still open — treat as risky; try cancel and abort to avoid naked PM
-                self._entry_busy = False
-                logger.warning("PF order still open after wait — aborting pair (no PM leg)")
+                # still open — cancel; if any partial fill keep it, else reject
+                logger.warning("PF order still open after wait — cancel")
                 try:
                     await self.pf.cancel_order(pf_fill.order_id, getattr(pf_fill, "order_hash", "") or "")
                 except Exception:
                     pass
-                pf_fill = Fill(status="REJECTED", reason="not filled in time", order_id=pf_fill.order_id)
+                if sh > 0.5:
+                    px = float(polled.get("avgPrice") or lim_px or 0) or lim_px
+                    pf_fill = Fill(status="FILLED", shares=sh, price=px, usd=round(sh * px, 4),
+                                   order_id=pf_fill.order_id,
+                                   order_hash=getattr(pf_fill, "order_hash", "") or "")
+                    logger.info("PF partial kept net_shares=%.4f", sh)
+                else:
+                    self._entry_busy = False
+                    pf_fill = Fill(status="REJECTED", reason="not filled in time", order_id=pf_fill.order_id)
 
         self._apply_fill(hedge.pf_leg, pf_fill)
 
@@ -479,7 +503,7 @@ class HedgeEngine:
             self._entry_busy = False
             logger.warning("PF reject %s — abort pair", pf_fill.reason)
             if "jurisdiction" in reason or "403" in reason or "forbidden" in reason:
-                self.pf_entry_cooldown_until = now + 3600.0  # 1h — geo block
+                self.pf_entry_cooldown_until = now + 3600.0
                 self.last_error = "Predict 403: not available in your jurisdiction"
                 logger.error(
                     "Predict blocked by jurisdiction (403). "
@@ -490,16 +514,20 @@ class HedgeEngine:
                 self.pf_entry_cooldown_until = now + 120.0
                 self.last_error = "Predict insufficient USDT balance/allowance"
             else:
-                self.pf_entry_cooldown_until = now + 15.0
+                # brief cooldown so we refresh quotes before retry
+                self.pf_entry_cooldown_until = now + 8.0
             return
 
-        # Only size PM to confirmed PF fill — one attempt path only
-        filled = pf_fill.shares if pf_fill.shares > 0 else shares
+        # PM size = *actual net* PF shares (equal share hedge, not equal $)
+        filled = float(pf_fill.shares) if pf_fill.shares > 0 else shares
+        hedge.pm_leg.requested_shares = filled
         if hedge.pm_leg.order_id and hedge.pm_leg.status in ("FILLED", "SUBMITTED"):
             logger.warning("PM leg already has order %s — skip second place", hedge.pm_leg.order_id[:18])
             return
-        # 2) Polymarket for the filled size (FOK preferred — see client)
-        pm_resp = await self.pm.place_market_buy(str(pm_token), filled, pm_ask)
+        # 2) Polymarket FOK for the same share count (aggressive +2¢)
+        pm_px = min(0.99, round(float(pm_ask) + 0.02, 2))
+        logger.info("PM BUY match PF net=%.4f @ limit %.2f (ask=%.2f)", filled, pm_px, pm_ask)
+        pm_resp = await self.pm.place_market_buy(str(pm_token), filled, pm_px)
         pm_fill = fill_from_pm_order(pm_resp, filled)
         self._apply_fill(hedge.pm_leg, pm_fill)
 
