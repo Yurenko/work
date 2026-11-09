@@ -41,6 +41,7 @@ class Leg:
     order_id: str = ""
     requested_shares: float = 0.0
     filled_shares: float = 0.0
+    entry_usd: float = 0.0
     reject_reason: str = ""
 
 
@@ -632,6 +633,14 @@ class HedgeEngine:
             leg.filled_shares = fill.shares
             leg.shares = fill.shares
             leg.entry_price = fill.price
+            # Prefer explicit USD from venue (PM makingAmount); else shares×price
+            if fill.usd and fill.usd > 0:
+                leg.entry_usd = float(fill.usd)
+            elif fill.shares > 0 and fill.price > 0:
+                leg.entry_usd = round(fill.shares * fill.price, 4)
+            # Re-derive avg if usd known (more accurate than limit)
+            if leg.entry_usd > 0 and leg.filled_shares > 0:
+                leg.entry_price = round(leg.entry_usd / leg.filled_shares, 4)
         elif fill.status == "REJECTED":
             leg.status = "REJECTED"
         elif fill.status == "SUBMITTED":
@@ -815,8 +824,15 @@ class HedgeEngine:
             return
 
         if hedge.pf_leg.status == "CLOSED" and hedge.pm_leg.status == "CLOSED":
-            pf_pnl = (hedge.pf_leg.exit_price - hedge.pf_leg.entry_price) * (hedge.pf_leg.filled_shares or 0)
-            pm_pnl = (hedge.pm_leg.exit_price - hedge.pm_leg.entry_price) * (hedge.pm_leg.filled_shares or 0)
+            def _leg_pnl_exit(leg: Leg) -> float:
+                sh = float(leg.filled_shares or 0)
+                if sh <= 0:
+                    return 0.0
+                cost = float(leg.entry_usd or 0) or float(leg.entry_price or 0) * sh
+                proceeds = float(leg.exit_usd or 0) or float(leg.exit_price or 0) * sh
+                return proceeds - cost
+            pf_pnl = _leg_pnl_exit(hedge.pf_leg)
+            pm_pnl = _leg_pnl_exit(hedge.pm_leg)
             hedge.pnl = pf_pnl + pm_pnl
             hedge.exit_sum = float(hedge.pf_leg.exit_price or 0) + float(hedge.pm_leg.exit_price or 0)
             hedge.close_reason = hedge.close_reason or "EXIT"
@@ -901,8 +917,20 @@ class HedgeEngine:
             leg.exit_usd = leg.exit_price * leg.filled_shares
             leg.status = "CLOSED"
 
-        pf_pnl = (hedge.pf_leg.exit_price - hedge.pf_leg.entry_price) * (hedge.pf_leg.filled_shares or 0)
-        pm_pnl = (hedge.pm_leg.exit_price - hedge.pm_leg.entry_price) * (hedge.pm_leg.filled_shares or 0)
+        def _leg_pnl(leg: Leg) -> float:
+            sh = float(leg.filled_shares or 0)
+            if sh <= 0:
+                return 0.0
+            entry_cost = float(leg.entry_usd or 0)
+            if entry_cost <= 0 and leg.entry_price:
+                entry_cost = float(leg.entry_price) * sh
+            exit_val = float(leg.exit_usd or 0)
+            if exit_val <= 0 and leg.exit_price is not None:
+                exit_val = float(leg.exit_price) * sh
+            return exit_val - entry_cost
+
+        pf_pnl = _leg_pnl(hedge.pf_leg)
+        pm_pnl = _leg_pnl(hedge.pm_leg)
         hedge.pnl = pf_pnl + pm_pnl
         hedge.exit_sum = float(hedge.pf_leg.exit_price or 0) + float(hedge.pm_leg.exit_price or 0)
         if hedge.close_reason != "EXIT":
@@ -952,17 +980,27 @@ class HedgeEngine:
         now = _time.time()
 
         def leg_snap(leg: Leg) -> dict:
+            sh = float(leg.filled_shares or leg.shares or 0)
+            entry_usd = float(getattr(leg, "entry_usd", 0) or 0)
+            if entry_usd <= 0 and sh > 0 and leg.entry_price:
+                entry_usd = round(sh * float(leg.entry_price), 4)
+            exit_usd = float(leg.exit_usd or 0)
+            if exit_usd <= 0 and sh > 0 and leg.exit_price is not None:
+                exit_usd = round(sh * float(leg.exit_price), 4)
             return {
                 "venue": leg.venue,
                 "direction": leg.direction,
                 "token": leg.token_or_market,
                 "status": leg.status,
-                "shares": leg.filled_shares or leg.shares,
+                "shares": sh,
                 "entry": leg.entry_price,
                 "exit": leg.exit_price,
                 "entry_price": leg.entry_price,
                 "exit_price": leg.exit_price,
-                "filled_shares": leg.filled_shares or leg.shares,
+                "filled_shares": sh,
+                "entry_usd": entry_usd,
+                "exit_usd": exit_usd,
+                "pnl": round(exit_usd - entry_usd, 4) if sh > 0 else 0.0,
             }
 
         # Active PF market = soonest ending with a book
