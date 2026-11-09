@@ -496,6 +496,52 @@ class PredictClient:
             logger.debug("PF balance fetch failed: %s", e)
             return None
 
+    async def get_position_for_market(self, market_id: str | int) -> dict | None:
+        """GET /v1/positions?marketId= — amount (shares) + averageBuyPriceUsd (real cost)."""
+        data = await self._request(
+            "GET",
+            "/v1/positions",
+            params={"marketId": str(market_id), "first": "20"},
+            with_jwt=True,
+        )
+        rows = data if isinstance(data, list) else (
+            (data or {}).get("data") if isinstance(data, dict) else None
+        )
+        if not isinstance(rows, list) or not rows:
+            return None
+        # Prefer largest amount position in this market
+        best = None
+        best_amt = -1.0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw = row.get("amount") or 0
+            try:
+                amt = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if amt > 1e12:  # wei
+                amt = amt / 1e18
+            if amt > best_amt:
+                best_amt = amt
+                best = row
+        if not best:
+            return None
+        avg = best.get("averageBuyPriceUsd") or best.get("averageBuyPrice") or best.get("avgPrice")
+        try:
+            avg_f = float(avg) if avg is not None else 0.0
+        except (TypeError, ValueError):
+            avg_f = 0.0
+        # avg sometimes in wei-ish string already decimal USD per share (0-1)
+        if avg_f > 1.5:
+            avg_f = avg_f / 1e18
+        return {
+            "shares": round(best_amt, 4),
+            "avg_price": round(avg_f, 4) if avg_f > 0 else 0.0,
+            "value_usd": best.get("valueUsd"),
+            "raw": best,
+        }
+
     async def place_order(
         self,
         market_id: str | int,

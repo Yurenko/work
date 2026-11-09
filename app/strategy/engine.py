@@ -496,6 +496,34 @@ class HedgeEngine:
 
         self._apply_fill(hedge.pf_leg, pf_fill)
 
+        # Reconcile PF shares + avg cost from positions API (truth vs limit price)
+        if pf_fill.status == "FILLED" and self.settings.is_live:
+            try:
+                import asyncio as _asyncio
+                await _asyncio.sleep(0.6)  # let settlement land
+                pos = await self.pf.get_position_for_market(pf_m["id"])
+                if pos and pos.get("shares", 0) > 0:
+                    real_sh = float(pos["shares"])
+                    real_px = float(pos.get("avg_price") or 0)
+                    if real_px <= 0 and real_sh > 0 and pf_fill.usd > 0:
+                        real_px = pf_fill.usd / real_sh
+                    if real_px > 0:
+                        logger.info(
+                            "PF position reconcile market=%s shares=%.4f→%.4f avg=%.4f→%.4f",
+                            pf_m["id"], pf_fill.shares, real_sh, pf_fill.price, real_px,
+                        )
+                        pf_fill = Fill(
+                            status="FILLED",
+                            shares=round(real_sh, 4),
+                            price=round(real_px, 4),
+                            usd=round(real_sh * real_px, 4),
+                            order_id=pf_fill.order_id,
+                            order_hash=getattr(pf_fill, "order_hash", "") or "",
+                        )
+                        self._apply_fill(hedge.pf_leg, pf_fill)
+            except Exception as e:
+                logger.warning("PF position reconcile failed: %s", e)
+
         if pf_fill.status == "REJECTED":
             hedge.status = "CLOSED"
             hedge.closed_at = time.time()
@@ -558,7 +586,17 @@ class HedgeEngine:
         if pf_fill.status == "FILLED" and pm_fill.status == "FILLED":
             hedge.status = "OPEN"
             self._entry_busy = False
-            logger.info("Hedge %s OPEN PF %.2f + PM %.2f", hedge.id, pf_fill.shares, pm_fill.shares)
+            # Real entry sum from actual fill prices (not pre-trade quote sum)
+            hedge.entry_sum = round(
+                float(hedge.pf_leg.entry_price or 0) + float(hedge.pm_leg.entry_price or 0), 4
+            )
+            logger.info(
+                "Hedge %s OPEN PF %.2f@%.3f + PM %.2f@%.3f entry_sum=%.3f",
+                hedge.id,
+                pf_fill.shares, hedge.pf_leg.entry_price,
+                pm_fill.shares, hedge.pm_leg.entry_price,
+                hedge.entry_sum,
+            )
         elif pf_fill.status == "FILLED" or pm_fill.status == "FILLED":
             hedge.status = "PARTIAL"
             self._entry_busy = False
