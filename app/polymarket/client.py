@@ -404,12 +404,19 @@ class PolymarketClient:
             args = OrderArgs(token_id=token_id, price=px, size=sz, side=order_side)
             signed = client.create_order(args)
             # Prefer FOK so we don't leave resting orders that later fill as a 2nd leg
-            order_type = getattr(OrderType, "FOK", None) or getattr(OrderType, "FAK", None) or OrderType.GTC
+            # Prefer FOK/FAK so we never leave a resting order that can fill later + duplicate
+            order_type = getattr(OrderType, "FOK", None) or getattr(OrderType, "FAK", None)
+            if order_type is None:
+                order_type = OrderType.GTC
             try:
                 resp = client.post_order(signed, order_type)
             except Exception as e1:
-                logger.warning("PM post_order %s failed (%s) — fallback GTC", order_type, e1)
-                resp = client.post_order(signed, OrderType.GTC)
+                logger.warning("PM post_order %s failed (%s)", order_type, e1)
+                # Only fall back to GTC for BUY if FOK unsupported; caller must cancel if LIVE
+                try:
+                    resp = client.post_order(signed, OrderType.GTC)
+                except Exception as e2:
+                    return {"status": "REJECTED", "reason": str(e2)}
             logger.info("PM LIVE %s type=%s resp=%s", side, order_type, resp)
             if not resp or (isinstance(resp, dict) and resp.get("error")):
                 reason = (resp or {}).get("error") if isinstance(resp, dict) else "rejected"

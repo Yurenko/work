@@ -484,8 +484,11 @@ class HedgeEngine:
                 self.pf_entry_cooldown_until = now + 15.0
             return
 
-        # Only size PM to confirmed PF fill
+        # Only size PM to confirmed PF fill — one attempt path only
         filled = pf_fill.shares if pf_fill.shares > 0 else shares
+        if hedge.pm_leg.order_id and hedge.pm_leg.status in ("FILLED", "SUBMITTED"):
+            logger.warning("PM leg already has order %s — skip second place", hedge.pm_leg.order_id[:18])
+            return
         # 2) Polymarket for the filled size (FOK preferred — see client)
         pm_resp = await self.pm.place_market_buy(str(pm_token), filled, pm_ask)
         pm_fill = fill_from_pm_order(pm_resp, filled)
@@ -545,8 +548,15 @@ class HedgeEngine:
                 continue
             if hedge.status in ("OPENING", "PARTIAL"):
                 await self._retry_partial(hedge, now)
-            if hedge.status in ("OPEN", "PARTIAL") and now >= hedge.market_end:
+            # Past window end → settlement only (no more sells on dead markets)
+            if hedge.status in ("OPEN", "PARTIAL", "CLOSING") and now >= hedge.market_end:
+                if hedge.status == "CLOSING":
+                    logger.info(
+                        "Hedge %s CLOSING past end → SETTLE (stop sell spam on closed market)",
+                        hedge.id,
+                    )
                 hedge.status = "SETTLING"
+                await self._settle_pair(hedge, now)
                 continue
             if hedge.status == "OPEN":
                 await self._try_exit(hedge, now)
@@ -578,9 +588,11 @@ class HedgeEngine:
                 self._apply_fill(hedge.pf_leg, fill_from_predict(resp, hedge.pf_leg.requested_shares))
 
         if hedge.pm_leg.status != "FILLED" and hedge.pf_leg.status == "FILLED":
+            if (hedge.pm_leg.filled_shares or 0) > 0:
+                logger.info("PM already has %.2f filled — skip retry buy", hedge.pm_leg.filled_shares)
             _, ask = self._pm_best(hedge.pm_leg.direction)
             size = hedge.pf_leg.filled_shares or hedge.pf_leg.requested_shares
-            if ask and size > 0:
+            if ask and size > 0 and (hedge.pm_leg.filled_shares or 0) <= 0:
                 # Cancel any previous resting PM order first
                 if hedge.pm_leg.order_id and hedge.pm_leg.status == "SUBMITTED":
                     try:
@@ -664,10 +676,32 @@ class HedgeEngine:
             logger.warning("%s sell rejected: %s", label, fill.reason)
 
     async def _finish_exit(self, hedge: Hedge, now: float) -> None:
+        # Throttle sell attempts (avoid 1Hz spam when market closed)
+        last = float(getattr(hedge, "last_exit_try_at", 0) or 0)
+        if now - last < 3.0:
+            return
+        hedge.last_exit_try_at = now
+        hedge.exit_tries = int(getattr(hedge, "exit_tries", 0) or 0) + 1
+
         if hedge.pf_leg.status != "CLOSED":
             await self._sell_leg(hedge.pf_leg, "PF")
         if hedge.pm_leg.status != "CLOSED":
             await self._sell_leg(hedge.pm_leg, "PM")
+
+        # Dead market / too many fails → wait for settlement at end
+        for leg in (hedge.pf_leg, hedge.pm_leg):
+            reason = (leg.reject_reason or "").lower()
+            if "not currently trading" in reason or "market_not_trading" in reason:
+                logger.warning(
+                    "Hedge %s exit blocked (market not trading) — will SETTLE at end",
+                    hedge.id,
+                )
+                # keep CLOSING until market_end flips to SETTLING in _manage_open
+                return
+        if hedge.exit_tries >= 8:
+            logger.warning("Hedge %s exit tries exhausted — hold to SETTLE", hedge.id)
+            return
+
         if hedge.pf_leg.status == "CLOSED" and hedge.pm_leg.status == "CLOSED":
             pf_pnl = (hedge.pf_leg.exit_price - hedge.pf_leg.entry_price) * (hedge.pf_leg.filled_shares or 0)
             pm_pnl = (hedge.pm_leg.exit_price - hedge.pm_leg.entry_price) * (hedge.pm_leg.filled_shares or 0)
