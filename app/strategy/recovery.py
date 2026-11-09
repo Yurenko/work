@@ -65,6 +65,13 @@ class RecoveryBook:
         self.processed_ids: list[str] = []
         self.load()
 
+    def reset(self) -> None:
+        """Back to base size / zero debt (manual recovery clear)."""
+        self.recovery_debt = 0.0
+        self.recovery_level = 0
+        self.current_shares = float(self.config.base_shares)
+        self.save()
+
     def shares_for_entry(self) -> float:
         """Share count for both venues. Frozen by the caller once the pair is open."""
         return float(self.current_shares)

@@ -91,6 +91,7 @@ class HedgeEngine:
             max_debt_usd=self.settings.max_recovery_debt_usd,
         )
         self.recovery = RecoveryBook(cfg, Path("data/recovery.json"))
+        self._entry_busy = False
 
     # ── lifecycle ───────────────────────────────────────────────
 
@@ -111,6 +112,7 @@ class HedgeEngine:
             self._task = None
         await self.pf.close()
         await self.pm.close()
+        self._entry_busy = False
         logger.info("HedgeEngine stopped")
 
     async def _loop(self) -> None:
@@ -368,6 +370,8 @@ class HedgeEngine:
         candidates.sort(key=lambda x: x[0])
         entry_sum, pf_dir, pm_dir = candidates[0]
 
+        if self._entry_busy:
+            return
         shares = self.recovery.shares_for_entry()
         # already have open hedge on this window?
         window_end = min(pm_end, pf_end)
@@ -375,6 +379,7 @@ class HedgeEngine:
             if h.status in ("OPENING", "PARTIAL", "OPEN", "CLOSING") and abs(h.market_end - window_end) < 30:
                 return
 
+        self._entry_busy = True
         logger.info(
             "ENTRY signal sum=%.3f PF %s + PM %s shares=%.1f pf_id=%s ends_in=%ds",
             entry_sum, pf_dir, pm_dir, shares, pf_m.get("id"), int(window_end - now),
@@ -455,6 +460,7 @@ class HedgeEngine:
                 pf_fill = Fill(status="REJECTED", reason=polled.get("reason") or "cancelled", order_id=pf_fill.order_id)
             else:
                 # still open — treat as risky; try cancel and abort to avoid naked PM
+                self._entry_busy = False
                 logger.warning("PF order still open after wait — aborting pair (no PM leg)")
                 try:
                     await self.pf.cancel_order(pf_fill.order_id, getattr(pf_fill, "order_hash", "") or "")
@@ -468,6 +474,7 @@ class HedgeEngine:
             hedge.status = "CLOSED"
             hedge.closed_at = time.time()
             reason = (pf_fill.reason or "").lower()
+            self._entry_busy = False
             logger.warning("PF reject %s — abort pair", pf_fill.reason)
             if "jurisdiction" in reason or "403" in reason or "forbidden" in reason:
                 self.pf_entry_cooldown_until = now + 3600.0  # 1h — geo block
@@ -520,12 +527,15 @@ class HedgeEngine:
 
         if pf_fill.status == "FILLED" and pm_fill.status == "FILLED":
             hedge.status = "OPEN"
+            self._entry_busy = False
             logger.info("Hedge %s OPEN PF %.2f + PM %.2f", hedge.id, pf_fill.shares, pm_fill.shares)
         elif pf_fill.status == "FILLED" or pm_fill.status == "FILLED":
             hedge.status = "PARTIAL"
+            self._entry_busy = False
             logger.info("Hedge %s PARTIAL PF=%s PM=%s", hedge.id, pf_fill.status, pm_fill.status)
         else:
             hedge.status = "OPENING"
+            self._entry_busy = False
 
     def _apply_fill(self, leg: Leg, fill: Fill) -> None:
         leg.order_id = fill.order_id or leg.order_id
