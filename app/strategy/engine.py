@@ -450,6 +450,8 @@ class HedgeEngine:
             polled = await self.pf.wait_order_fill(
                 pf_fill.order_id, shares, lim_px, timeout=12.0,
                 order_hash=getattr(pf_fill, "order_hash", "") or "",
+                is_buy=True,
+                fee_bps=int(getattr(self, "_pf_fee_bps", 200) or 200),
             )
             if str(polled.get("status") or "").upper() == "FILLED":
                 px = float(polled.get("avgPrice") or lim_px or 0) or lim_px

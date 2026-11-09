@@ -42,6 +42,7 @@ def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float
     """Limit price and size for a BUY that CLOB will accept.
 
     CLOB: maker (USDC = size × price) max 2 decimals, taker (shares) max 4.
+    We pick integer USDC cents first, then derive size so size*limit has ≤2 decimals.
     """
     ask = float(ask)
     target = float(target_shares)
@@ -50,17 +51,28 @@ def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float
     limit = _floor_dec(ask, 2)
     if limit <= 0:
         return 0.0, 0.0
-    # budget in cents
-    budget_cents = int(math.floor(target * ask * 100 + 1e-9))
+    # max USDC we are willing to spend (2 decimals)
+    budget_cents = int(math.floor(target * limit * 100 + 1e-9))
     if budget_cents < 1:
         return limit, 0.0
-    # size so size * limit <= budget
-    size = _floor_dec(budget_cents / 100.0 / limit, 4)
-    if size * limit > budget_cents / 100.0 + 1e-9:
-        size = _floor_dec((budget_cents / 100.0) / limit, 4)
-    if size < 5.0 and target >= 5.0:
-        # try to stay near min 5 if budget allows
-        size = max(size, min(5.0, _floor_dec(budget_cents / 100.0 / limit, 4)))
+    usdc = budget_cents / 100.0
+    # size with 4 decimals such that size * limit <= usdc
+    size = _floor_dec(usdc / limit, 4)
+    # re-quantize maker to exact cents
+    for _ in range(8):
+        maker_cents = int(math.floor(size * limit * 100 + 1e-9))
+        if maker_cents < 1:
+            return limit, 0.0
+        maker = maker_cents / 100.0
+        size2 = _floor_dec(maker / limit, 4)
+        if abs(size2 - size) < 1e-12 and abs(size2 * limit - maker) < 1e-9:
+            size = size2
+            break
+        size = size2
+    if size < 5.0 and target >= 5.0 and budget_cents >= int(math.ceil(5.0 * limit * 100 - 1e-9)):
+        size = _floor_dec(5.0, 4)
+        maker_cents = int(math.floor(size * limit * 100 + 1e-9))
+        size = _floor_dec((maker_cents / 100.0) / limit, 4)
     return limit, size
 
 

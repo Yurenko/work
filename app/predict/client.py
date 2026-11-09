@@ -796,6 +796,8 @@ class PredictClient:
         price: float,
         timeout: float = 12.0,
         order_hash: str = "",
+        is_buy: bool = True,
+        fee_bps: int = 200,
     ) -> dict:
         """Poll order status until FILLED/CANCELLED or timeout.
 
@@ -843,11 +845,19 @@ class PredictClient:
                 out["status"] = "FILLED"
                 if out["filledShares"] <= 0:
                     out["filledShares"] = shares
+                # Taker BUY: fee is taken in shares → position < amountFilled
+                if is_buy and fee_bps > 0 and out["filledShares"] > 0:
+                    net = out["filledShares"] * (1.0 - float(fee_bps) / 10000.0)
+                    out["filledShares"] = round(net, 4)
+                    out["fee_bps"] = fee_bps
             elif st in ("CANCELLED", "CANCELED", "REJECTED", "FAILED", "EXPIRED", "INVALIDATED"):
                 out["status"] = "REJECTED"
                 out["reason"] = st
             elif out["filledShares"] >= shares * 0.95:
                 out["status"] = "FILLED"
+                if is_buy and fee_bps > 0:
+                    out["filledShares"] = round(out["filledShares"] * (1.0 - float(fee_bps) / 10000.0), 4)
+                    out["fee_bps"] = fee_bps
             return out
 
         while time.time() < deadline:
