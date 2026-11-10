@@ -543,10 +543,13 @@ class HedgeEngine:
                         break
                 if real_px <= 0:
                     real_px = float(pf_fill.price or 0)
-                # Guard: never use avg that is >15% below limit without USD proof
-                if lim > 0 and real_px > 0 and real_px < lim * 0.85 and real_usd <= 0:
+                # Prefer any positive cost_usd from activity/positions
+                if real_usd > 0 and real_sh > 0:
+                    real_px = real_usd / real_sh
+                # Only reject low avg when we have NO usd confirmation at all
+                elif lim > 0 and real_px > 0 and real_px < lim * 0.70:
                     logger.warning(
-                        "PF reconcile suspicious avg %.4f << limit %.4f without cost_usd — keep limit-based",
+                        "PF reconcile avg %.4f << limit %.4f without cost_usd — keep fill/limit",
                         real_px, lim,
                     )
                     real_px = float(pf_fill.price or lim)
@@ -878,56 +881,110 @@ class HedgeEngine:
             )
 
     async def _settle_pair(self, hedge: Hedge, now: float) -> None:
-        """At expiry: each leg settles to 0 or 1 — opposite legs are complementary.
+        """Settle each leg from **venue resolution**, not mid-price guess.
 
-        One shared outcome for the window (Up won / Down won). Then:
-          direction==up  → exit 1 if Up won else 0
-          direction==down → exit 0 if Up won else 1
-        So opposite PF/PM legs always sum to 1.0 (never both 0 or both 1).
+        PF and PM can resolve differently (different oracles). We wait for
+        official resolution; if still pending after 90s, fall back to quotes.
         """
         if now < hedge.market_end:
             return
 
-        # Prefer extreme quotes near expiry; else mid >= 0.5
-        ub, ua = self._pf_best(hedge.pf_leg.token_or_market, "up")
-        pf_mid = None
-        if ub is not None and ua is not None:
-            pf_mid = 0.5 * (ub + ua)
-        elif ub is not None:
-            pf_mid = ub
-        elif ua is not None:
-            pf_mid = ua
+        wait_s = now - float(hedge.market_end or now)
+        pf_up_won: bool | None = None
+        pm_up_won: bool | None = None
 
-        pm_ub, pm_ua = self._pm_best("up")
-        pm_mid = None
-        if pm_ub is not None and pm_ua is not None:
-            pm_mid = 0.5 * (pm_ub + pm_ua)
-        elif pm_ub is not None:
-            pm_mid = pm_ub
-        elif pm_ua is not None:
-            pm_mid = pm_ua
+        # --- Predict.fun resolution ---
+        try:
+            mid = hedge.pf_leg.token_or_market
+            # token_or_market may be market id
+            pf_up_won = await self.pf.market_up_won(mid)
+        except Exception as e:
+            logger.warning("PF resolution lookup failed: %s", e)
 
-        def decide_up_won() -> bool:
-            # Strong signals first
-            for bid, ask in ((ub, ua), (pm_ub, pm_ua)):
-                if ask is not None and ask <= 0.08:
-                    return False
-                if bid is not None and bid >= 0.92:
-                    return True
-            # Prefer clearer mid (farther from 0.5)
-            candidates = [m for m in (pf_mid, pm_mid) if m is not None]
-            if not candidates:
-                return True  # default Up if totally unknown
-            # pick extreme-most mid
-            best = max(candidates, key=lambda x: abs(x - 0.5))
-            return best >= 0.5
+        # --- Polymarket Gamma resolution ---
+        try:
+            slug = ""
+            if self.pm_market:
+                slug = str(self.pm_market.get("slug") or "")
+            # Prefer slug tied to this hedge window if stored
+            if not slug and hasattr(hedge, "pm_slug"):
+                slug = str(getattr(hedge, "pm_slug") or "")
+            if slug:
+                up_px = await self.pm.resolved_leg_price(slug, "up")
+                if up_px is not None:
+                    pm_up_won = up_px >= 0.99
+                elif up_px is not None and up_px <= 0.01:
+                    pm_up_won = False
+        except Exception as e:
+            logger.warning("PM resolution lookup failed: %s", e)
 
-        up_won = decide_up_won()
+        # Not ready yet — wait (caller retries each loop) unless timed out
+        if (pf_up_won is None or pm_up_won is None) and wait_s < 90:
+            logger.info(
+                "Hedge %s waiting resolution (t+%.0fs) pf=%s pm=%s",
+                hedge.id, wait_s,
+                "Up" if pf_up_won else ("Down" if pf_up_won is False else "?"),
+                "Up" if pm_up_won else ("Down" if pm_up_won is False else "?"),
+            )
+            return
+
+        # Fallback to mid quotes only after timeout
+        if pf_up_won is None or pm_up_won is None:
+            ub, ua = self._pf_best(hedge.pf_leg.token_or_market, "up")
+            pm_ub, pm_ua = self._pm_best("up")
+            def _mid(b, a):
+                if b is not None and a is not None:
+                    return 0.5 * (b + a)
+                return b if b is not None else a
+            pf_mid = _mid(ub, ua)
+            pm_mid = _mid(pm_ub, pm_ua)
+            if pf_up_won is None and pf_mid is not None:
+                pf_up_won = pf_mid >= 0.5
+            if pm_up_won is None and pm_mid is not None:
+                pm_up_won = pm_mid >= 0.5
+            if pf_up_won is None:
+                pf_up_won = True
+            if pm_up_won is None:
+                pm_up_won = pf_up_won
+            logger.warning(
+                "Hedge %s resolution timeout — fallback pf_up=%s pm_up=%s",
+                hedge.id, pf_up_won, pm_up_won,
+            )
+
+        if pf_up_won != pm_up_won:
+            logger.warning(
+                "Hedge %s VENUE DIVERGENCE pf_up=%s pm_up=%s — settling each leg on its own venue",
+                hedge.id, pf_up_won, pm_up_won,
+            )
+
+        # Final entry reconcile from positions (avg + shares) before PnL
+        if self.settings.is_live:
+            try:
+                pos = await self.pf.get_position_for_market(hedge.pf_leg.token_or_market)
+                if pos and pos.get("shares", 0) > 0:
+                    sh = float(pos["shares"])
+                    ap = float(pos.get("avg_price") or 0)
+                    cu = float(pos.get("cost_usd") or 0)
+                    if cu <= 0 and ap > 0:
+                        cu = sh * ap
+                    if sh > 0 and (ap > 0 or cu > 0):
+                        hedge.pf_leg.filled_shares = sh
+                        hedge.pf_leg.shares = sh
+                        if cu > 0:
+                            hedge.pf_leg.entry_usd = cu
+                            hedge.pf_leg.entry_price = cu / sh
+                        elif ap > 0:
+                            hedge.pf_leg.entry_price = ap
+                            hedge.pf_leg.entry_usd = sh * ap
+                        logger.info(
+                            "PF settle-reconcile shares=%.4f avg=%.4f usd=%.4f",
+                            sh, hedge.pf_leg.entry_price, hedge.pf_leg.entry_usd,
+                        )
+            except Exception as e:
+                logger.warning("PF settle-reconcile failed: %s", e)
 
         for leg in (hedge.pf_leg, hedge.pm_leg):
-            # Keep real market-sell exit if already closed via EXIT
             if leg.status == "CLOSED" and leg.exit_price is not None:
-                # only keep if it looks like a real trade (not default entry echo)
                 if abs(leg.exit_price - leg.entry_price) > 1e-9 or hedge.close_reason == "EXIT":
                     if hedge.close_reason == "EXIT":
                         continue
@@ -935,11 +992,13 @@ class HedgeEngine:
                 leg.status = "CLOSED"
                 leg.exit_price = leg.exit_price or 0.0
                 continue
+            # Per-venue outcome
+            won_up = pf_up_won if leg.venue in ("predict", "pf", "bn") else pm_up_won
             if leg.direction == "up":
-                leg.exit_price = 1.0 if up_won else 0.0
+                leg.exit_price = 1.0 if won_up else 0.0
             else:
-                leg.exit_price = 0.0 if up_won else 1.0
-            leg.exit_usd = leg.exit_price * leg.filled_shares
+                leg.exit_price = 0.0 if won_up else 1.0
+            leg.exit_usd = float(leg.exit_price) * float(leg.filled_shares or 0)
             leg.status = "CLOSED"
 
         def _leg_pnl(leg: Leg) -> float:
@@ -964,20 +1023,20 @@ class HedgeEngine:
         hedge.closed_at = now
         self.recovery.on_pair_closed(hedge.id, pf_pnl, pm_pnl, 0.0, hedge.pf_leg.filled_shares or 0)
         logger.info(
-            "Hedge %s %s up_won=%s pf=%s@%.3f→%.3f pm=%s@%.3f→%.3f exit_sum=%.3f pnl=%.4f",
+            "Hedge %s SETTLE pf_up=%s pm_up=%s pf=%s@%.3f→%.3f($%.2f) pm=%s@%.3f→%.3f($%.2f) pnl=%.4f",
             hedge.id,
-            hedge.close_reason,
-            up_won,
+            pf_up_won,
+            pm_up_won,
             hedge.pf_leg.direction,
             hedge.pf_leg.entry_price,
             hedge.pf_leg.exit_price,
+            pf_pnl,
             hedge.pm_leg.direction,
             hedge.pm_leg.entry_price,
             hedge.pm_leg.exit_price,
-            hedge.exit_sum,
+            pm_pnl,
             hedge.pnl,
         )
-
 
     async def test_buy(self, usd: float = 1.0) -> dict:
         """One Predict buy, no Polymarket. Proves the order path."""

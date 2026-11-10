@@ -269,6 +269,42 @@ class PredictClient:
     async def get_market(self, market_id: int | str) -> Optional[dict]:
         return await self._request("GET", f"/v1/markets/{market_id}")
 
+
+    async def market_up_won(self, market_id: str | int) -> bool | None:
+        """True if Up/Yes won, False if Down/No won, None if not resolved yet."""
+        data = await self._request("GET", f"/v1/markets/{market_id}")
+        mkt = data.get("data") if isinstance(data, dict) and "data" in data else data
+        if not isinstance(mkt, dict):
+            return None
+        status = str(mkt.get("tradingStatus") or mkt.get("status") or "").upper()
+        outcomes = mkt.get("outcomes") or []
+        if not isinstance(outcomes, list) or not outcomes:
+            return None
+        # Look for WON on Up/Yes or Down/No
+        up_won = None
+        for o in outcomes:
+            if not isinstance(o, dict):
+                continue
+            name = str(o.get("name") or "").lower()
+            ost = str(o.get("status") or "").upper()
+            if ost not in ("WON", "LOST"):
+                continue
+            is_up = name in ("up", "yes") or o.get("indexSet") in (1, "1")
+            is_down = name in ("down", "no") or o.get("indexSet") in (2, "2")
+            if is_up:
+                up_won = ost == "WON"
+            elif is_down:
+                up_won = ost != "WON" if up_won is None else up_won
+        if up_won is None and status in ("RESOLVED", "CLOSED", "SETTLED"):
+            # fallback: resolution object
+            res = mkt.get("resolution") if isinstance(mkt.get("resolution"), dict) else {}
+            rname = str(res.get("name") or "").lower()
+            if rname in ("up", "yes"):
+                return True
+            if rname in ("down", "no"):
+                return False
+        return up_won
+
     async def get_orderbook(self, market_id: int | str) -> Optional[dict]:
         """Orderbook prices are for the Yes outcome (0–1)."""
         return await self._request("GET", f"/v1/markets/{market_id}/orderbook")
@@ -592,10 +628,16 @@ class PredictClient:
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            name = str(row.get("name") or row.get("type") or row.get("outcome") or "").upper()
-            if "MATCH" not in name and "FILL" not in name and "BUY" not in name and name not in ("MATCH_SUCCESS", "FILLED"):
+            name = str(row.get("name") or row.get("type") or row.get("outcome") or row.get("title") or "").upper()
+            # UI labels: "Filled Buy", "Placed Buy", MATCH_SUCCESS, etc.
+            is_fillish = any(k in name for k in ("MATCH", "FILL", "BUY", "FILLED", "EXECUTE"))
+            if not is_fillish:
                 if row.get("priceExecuted") is None and row.get("price") is None and row.get("value") is None:
                     continue
+            # Skip pure "Placed" (limit resting) when a Filled row exists later
+            if "PLACED" in name and "FILL" not in name:
+                # still collect; VWAP prefers rows with value
+                pass
             m = row.get("market") if isinstance(row.get("market"), dict) else {}
             rid = str(m.get("id") or row.get("marketId") or "")
             if rid and rid != mid:
@@ -607,7 +649,10 @@ class PredictClient:
                 px = float(raw_px) if raw_px is not None else 0.0
             except (TypeError, ValueError):
                 px = 0.0
-            if px > 1.5:
+            # Activity UI shows 22¢ — API may return 0.22 OR 22 (cents)
+            if 1.5 < px <= 100:
+                px = px / 100.0
+            elif px > 100:
                 px = px / 1e18
             raw_sh = row.get("amountFilled") or row.get("amount") or row.get("shares") or 0
             try:
