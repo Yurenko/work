@@ -41,60 +41,48 @@ def _ceil_dec(value: float, decimals: int) -> float:
 def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float]:
     """Limit price and size for a BUY that CLOB will accept.
 
-    CLOB: maker (USDC = size × price) max 2 decimals, taker (shares) max 4.
-    Marketable BUY requires min ~$1 notional — if target × ask < $1.05,
-    **inflate shares** (not price) so notional ≥ $1.05. That is expected
-    on cheap tokens (e.g. 6 sh @ 0.08 → ~14–15 sh).
+    Polymarket market-buy: maker (USDC) max 2 decimals, taker (shares) max 4.
+    We build size so size * limit has *exact* 2 decimal places.
+    Min notional ~$1.05 (CLOB rejects under ~$1).
     """
-    ask = float(ask)
-    target = float(target_shares)
-    if ask <= 0 or target <= 0:
-        return 0.0, 0.0
-    limit = _floor_dec(ask, 2)
-    if limit <= 0:
-        return 0.0, 0.0
-
     MIN_USD = 1.05
-    min_shares_for_min_usd = MIN_USD / limit
-    if target < min_shares_for_min_usd:
-        target = min_shares_for_min_usd
-
-    budget_cents = int(math.floor(target * limit * 100 + 1e-9))
-    if budget_cents < int(MIN_USD * 100):
-        budget_cents = int(math.ceil(MIN_USD * 100))
-    usdc = budget_cents / 100.0
-    size = _floor_dec(usdc / limit, 4)
-    for _ in range(8):
-        maker_cents = int(math.floor(size * limit * 100 + 1e-9))
-        if maker_cents < int(MIN_USD * 100):
-            maker_cents = int(math.ceil(MIN_USD * 100))
-            size = _floor_dec((maker_cents / 100.0) / limit, 4)
-            continue
-        maker = maker_cents / 100.0
-        size2 = _floor_dec(maker / limit, 4)
-        if abs(size2 - size) < 1e-12 and abs(size2 * limit - maker) < 1e-9:
-            size = size2
-            break
-        size = size2
-    if size * limit < MIN_USD - 1e-9:
-        size = _floor_dec(MIN_USD / limit + 0.0001, 4)
-    # Final: maker USDC must be exact 2dp; adjust size so size*limit == maker cents/100
-    maker_cents = int(round(size * limit * 100))
+    if ask is None or ask <= 0 or target_shares is None or target_shares <= 0:
+        return 0.0, 0.0
+    # Limit: a few ticks above ask, 2dp
+    limit = min(0.99, _ceil_dec(float(ask) + 0.01, 2))
+    if limit < 0.01:
+        limit = 0.01
+    # Desired notional from target shares
+    notional = max(float(target_shares) * limit, MIN_USD)
+    # Maker must be exact cents
+    maker_cents = int(math.ceil(notional * 100 - 1e-9))
     if maker_cents < int(MIN_USD * 100):
-        maker_cents = int(MIN_USD * 100)
-    size = _floor_dec(maker_cents / 100.0 / limit, 4)
-    # re-check exact
-    for _ in range(5):
+        maker_cents = int(math.ceil(MIN_USD * 100))
+    maker = maker_cents / 100.0
+    # size = maker / limit, floored to 4dp, then re-fit maker so product is exact
+    size = _floor_dec(maker / limit, 4)
+    # Recompute maker from size*limit and snap to 2dp *down* so we never overshoot
+    for _ in range(8):
         mc = int(math.floor(size * limit * 100 + 1e-9))
         if mc < int(MIN_USD * 100):
-            size = _floor_dec((int(MIN_USD * 100) / 100.0) / limit + 1e-9, 4)
+            mc = int(MIN_USD * 100)
+            size = _floor_dec(mc / 100.0 / limit + 1e-12, 4)
             continue
-        size2 = _floor_dec(mc / 100.0 / limit, 4)
-        if abs(size2 - size) < 1e-12:
-            size = size2
+        # Check size*limit == mc/100 within 1e-9
+        if abs(size * limit - mc / 100.0) < 1e-9:
             break
-        size = size2
+        # Adjust size so product lands on mc cents
+        size = _floor_dec(mc / 100.0 / limit, 4)
+        if size <= 0:
+            size = _floor_dec(MIN_USD / limit, 4)
+            break
+    # Final guarantee: quantize size so floor(size*limit*100) works for API
+    mc = int(math.floor(size * limit * 100 + 1e-9))
+    if mc >= int(MIN_USD * 100):
+        # Prefer size that yields exactly mc cents when rounded by client
+        size = _floor_dec(mc / 100.0 / limit, 4)
     return limit, size
+
 
 
 def top_of_book(bids: list, asks: list) -> tuple[Optional[float], Optional[float]]:
@@ -213,9 +201,19 @@ class PolymarketClient:
 
     async def resolved_leg_price(self, slug: str, direction: str) -> Optional[float]:
         event = await self.event_by_slug(slug)
-        if not event:
-            return None
-        res = resolved_updown(event)
+        res = resolved_updown(event) if event else None
+        if res is None:
+            # Fallback: /markets?slug= (sometimes more up-to-date than /events)
+            try:
+                http = await self._ensure_http()
+                r = await http.get(f"{GAMMA}/markets", params={"slug": slug})
+                if r.status_code == 200:
+                    data = r.json()
+                    mkt = data[0] if isinstance(data, list) and data else data
+                    if isinstance(mkt, dict):
+                        res = resolved_updown({"markets": [mkt], "closed": mkt.get("closed")})
+            except Exception as e:
+                logger.debug("PM markets slug fallback: %s", e)
         if not res:
             return None
         return res.get(direction.lower())

@@ -755,7 +755,13 @@ class HedgeEngine:
 
         if hedge.pf_leg.status == "FILLED" and hedge.pm_leg.status == "FILLED":
             hedge.status = "OPEN"
-            logger.info("Hedge %s promoted PARTIAL→OPEN", hedge.id)
+            self._refresh_entry_sum(hedge)
+            logger.info(
+                "Hedge %s promoted PARTIAL→OPEN entry_sum=%.3f PF %.2f@%.3f PM %.2f@%.3f",
+                hedge.id, hedge.entry_sum,
+                hedge.pf_leg.filled_shares, hedge.pf_leg.entry_price,
+                hedge.pm_leg.filled_shares, hedge.pm_leg.entry_price,
+            )
 
     async def _try_exit(self, hedge: Hedge, now: float) -> None:
         """Early exit when sum of bids >= exit_sum_min (sell both legs at market).
@@ -961,6 +967,19 @@ class HedgeEngine:
                 hedge.pnl,
             )
 
+    def _refresh_entry_sum(self, hedge: Hedge) -> None:
+        """Recompute entry_sum from real leg entry_prices after fills/reconcile."""
+        pf_px = float(hedge.pf_leg.entry_price or 0)
+        pm_px = float(hedge.pm_leg.entry_price or 0)
+        if pf_px > 0 and pm_px > 0:
+            old = hedge.entry_sum
+            hedge.entry_sum = round(pf_px + pm_px, 4)
+            if abs(old - hedge.entry_sum) > 1e-4:
+                logger.info(
+                    "Hedge %s entry_sum %.3f → %.3f (pf@%.3f + pm@%.3f)",
+                    hedge.id, old, hedge.entry_sum, pf_px, pm_px,
+                )
+
     async def _settle_pair(self, hedge: Hedge, now: float) -> None:
         """Settle each leg from **venue resolution**, not mid-price guess.
 
@@ -1008,26 +1027,43 @@ class HedgeEngine:
         except Exception as e:
             logger.warning("PM resolution lookup failed: %s", e)
 
-        # Not ready yet — wait up to 3 min (Gamma often lags 30–120s)
-        if (pf_up_won is None or pm_up_won is None) and wait_s < 180:
-            logger.info(
-                "Hedge %s waiting resolution (t+%.0fs) pf=%s pm=%s slug=%s",
-                hedge.id, wait_s,
-                "Up" if pf_up_won else ("Down" if pf_up_won is False else "?"),
-                "Up" if pm_up_won else ("Down" if pm_up_won is False else "?"),
-                getattr(hedge, "pm_slug", "") or "?",
-            )
+        # Not ready yet — wait up to 4 min (Gamma often lags 30–180s)
+        if (pf_up_won is None or pm_up_won is None) and wait_s < 240:
+            # Throttle logs + gamma hammering to every 5s
+            last_log = float(getattr(hedge, "_last_res_log", 0) or 0)
+            if now - last_log >= 5.0:
+                hedge._last_res_log = now
+                logger.info(
+                    "Hedge %s waiting resolution (t+%.0fs) pf=%s pm=%s slug=%s",
+                    hedge.id, wait_s,
+                    "Up" if pf_up_won else ("Down" if pf_up_won is False else "?"),
+                    "Up" if pm_up_won else ("Down" if pm_up_won is False else "?"),
+                    getattr(hedge, "pm_slug", "") or "?",
+                )
             return
 
         # Fallback only after long timeout. Prefer matching the known venue;
         # do NOT use current-window mid (books already moved to next market).
         if pf_up_won is None or pm_up_won is None:
+            # One last PM attempt with explicit log of raw outcomePrices
+            if pm_up_won is None:
+                slug = str(getattr(hedge, "pm_slug", "") or "")
+                if slug:
+                    try:
+                        up_px = await self.pm.resolved_leg_price(slug, "up")
+                        logger.info("PM final resolution slug=%s up_px=%s", slug, up_px)
+                        if up_px is not None:
+                            if up_px >= 0.99:
+                                pm_up_won = True
+                            elif up_px <= 0.01:
+                                pm_up_won = False
+                    except Exception as e:
+                        logger.warning("PM final resolution error: %s", e)
             if pf_up_won is None and pm_up_won is not None:
                 pf_up_won = pm_up_won
             elif pm_up_won is None and pf_up_won is not None:
                 pm_up_won = pf_up_won  # assume same BTC outcome if PM Gamma lagging
             elif pf_up_won is None and pm_up_won is None:
-                # both unknown — last resort true (Up)
                 pf_up_won = True
                 pm_up_won = True
             logger.warning(
@@ -1042,6 +1078,7 @@ class HedgeEngine:
             )
 
         # Final entry reconcile from positions (avg + shares) before PnL
+        self._refresh_entry_sum(hedge)
         if self.settings.is_live:
             try:
                 pos = await self.pf.get_position_for_market(hedge.pf_leg.token_or_market)

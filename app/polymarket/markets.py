@@ -35,21 +35,33 @@ def _loads(raw: Any) -> list:
 
 
 def resolved_updown(event: dict) -> Optional[dict[str, float]]:
-    """Up/Down prices after Gamma has finished resolution. None while still calculating."""
-    markets = event.get("markets") or []
-    if not markets or not isinstance(markets[0], dict):
+    """Return {up: 0|1, down: 0|1} when market is fully resolved, else None."""
+    if not event:
         return None
-    market = markets[0]
-    status = str(market.get("umaResolutionStatus") or market.get("resolutionStatus") or "").lower()
+    markets = event.get("markets") or []
+    # Sometimes gamma returns the market object itself
+    if not markets and (event.get("outcomePrices") or event.get("outcomes")):
+        markets = [event]
+    if not markets:
+        return None
+    market = markets[0] if isinstance(markets[0], dict) else {}
+    status = str(
+        market.get("umaResolutionStatus")
+        or market.get("resolutionStatus")
+        or event.get("umaResolutionStatus")
+        or ""
+    ).lower()
     closed = market.get("closed") is True or str(market.get("closed") or "").lower() == "true"
     closed = closed or event.get("closed") is True or str(event.get("closed") or "").lower() == "true"
-    if not closed and status not in {"resolved", "settled"}:
-        return None
-    outcomes = [str(x).lower() for x in _loads(market.get("outcomes"))]
-    raw_prices = _loads(market.get("outcomePrices"))
+    # Also treat automaticallyResolved + prices at extremes as resolved
+    auto = market.get("automaticallyResolved") is True
+    outcomes = [str(x).lower() for x in _loads(market.get("outcomes") or event.get("outcomes"))]
+    raw_prices = _loads(market.get("outcomePrices") or event.get("outcomePrices"))
     if len(outcomes) < 2 or len(raw_prices) < 2:
         return None
+    # Parse prices first — if already 0/1 we can trust even before closed flag flips
     out: dict[str, float] = {}
+    ambiguous = False
     for name, raw in zip(outcomes, raw_prices):
         try:
             price = float(raw)
@@ -60,16 +72,23 @@ def resolved_updown(event: dict) -> Optional[dict[str, float]]:
         elif price <= 0.05:
             price = 0.0
         else:
-            return None  # still 50/50 / calculating
+            ambiguous = True
+            continue
         if name in ("up", "yes"):
             out["up"] = price
         elif name in ("down", "no"):
             out["down"] = price
-    if "up" not in out or "down" not in out:
+    if ambiguous or "up" not in out or "down" not in out:
         return None
     if abs(out["up"] + out["down"] - 1.0) > 0.05:
         return None
+    # Require closed/resolved OR both legs extreme (0 and 1)
+    if not (closed or status in {"resolved", "settled"} or auto):
+        # prices already extreme — accept (gamma lag on closed flag)
+        if not (out["up"] in (0.0, 1.0) and out["down"] in (0.0, 1.0)):
+            return None
     return out
+
 
 
 def parse_updown_market(event: dict) -> Optional[dict]:
