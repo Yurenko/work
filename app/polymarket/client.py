@@ -78,6 +78,22 @@ def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float
         size = size2
     if size * limit < MIN_USD - 1e-9:
         size = _floor_dec(MIN_USD / limit + 0.0001, 4)
+    # Final: maker USDC must be exact 2dp; adjust size so size*limit == maker cents/100
+    maker_cents = int(round(size * limit * 100))
+    if maker_cents < int(MIN_USD * 100):
+        maker_cents = int(MIN_USD * 100)
+    size = _floor_dec(maker_cents / 100.0 / limit, 4)
+    # re-check exact
+    for _ in range(5):
+        mc = int(math.floor(size * limit * 100 + 1e-9))
+        if mc < int(MIN_USD * 100):
+            size = _floor_dec((int(MIN_USD * 100) / 100.0) / limit + 1e-9, 4)
+            continue
+        size2 = _floor_dec(mc / 100.0 / limit, 4)
+        if abs(size2 - size) < 1e-12:
+            size = size2
+            break
+        size = size2
     return limit, size
 
 

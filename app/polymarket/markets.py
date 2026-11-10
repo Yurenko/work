@@ -55,12 +55,12 @@ def resolved_updown(event: dict) -> Optional[dict[str, float]]:
             price = float(raw)
         except (TypeError, ValueError):
             return None
-        if price >= 0.99:
+        if price >= 0.95:
             price = 1.0
-        elif price <= 0.01:
+        elif price <= 0.05:
             price = 0.0
         else:
-            return None
+            return None  # still 50/50 / calculating
         if name in ("up", "yes"):
             out["up"] = price
         elif name in ("down", "no"):

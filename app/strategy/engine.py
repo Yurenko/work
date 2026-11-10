@@ -60,6 +60,8 @@ class Hedge:
     close_reason: str = ""  # EXIT | SETTLE
     retries: int = 0
     last_retry_at: float = 0.0
+    pm_slug: str = ""  # fixed at open — used for resolution (not current window)
+    pf_market_id: str = ""
     # aliases for recovery/tests that still say bn
     @property
     def bn_leg(self) -> Leg:
@@ -412,6 +414,9 @@ class HedgeEngine:
             logger.warning("No PM token for %s", pm_dir)
             return
 
+        pm_slug_now = ""
+        if self.pm_market:
+            pm_slug_now = str(self.pm_market.get("slug") or "")
         hedge = Hedge(
             id=str(uuid.uuid4())[:8],
             opened_at=now,
@@ -430,6 +435,8 @@ class HedgeEngine:
             ),
             entry_sum=entry_sum,
             status="OPENING",
+            pm_slug=pm_slug_now,
+            pf_market_id=str(pf_m["id"]),
         )
         self.hedges.append(hedge)
 
@@ -895,60 +902,63 @@ class HedgeEngine:
 
         # --- Predict.fun resolution ---
         try:
-            mid = hedge.pf_leg.token_or_market
-            # token_or_market may be market id
+            mid = str(getattr(hedge, "pf_market_id", "") or hedge.pf_leg.token_or_market)
             pf_up_won = await self.pf.market_up_won(mid)
         except Exception as e:
             logger.warning("PF resolution lookup failed: %s", e)
 
-        # --- Polymarket Gamma resolution ---
+        # --- Polymarket Gamma resolution (ALWAYS the slug from open, not current window) ---
         try:
-            slug = ""
-            if self.pm_market:
+            slug = str(getattr(hedge, "pm_slug", "") or "")
+            if not slug and self.pm_market:
+                # last resort only if hedge opened before slug field existed
                 slug = str(self.pm_market.get("slug") or "")
-            # Prefer slug tied to this hedge window if stored
-            if not slug and hasattr(hedge, "pm_slug"):
-                slug = str(getattr(hedge, "pm_slug") or "")
             if slug:
                 up_px = await self.pm.resolved_leg_price(slug, "up")
                 if up_px is not None:
-                    pm_up_won = up_px >= 0.99
-                elif up_px is not None and up_px <= 0.01:
-                    pm_up_won = False
+                    if up_px >= 0.99:
+                        pm_up_won = True
+                    elif up_px <= 0.01:
+                        pm_up_won = False
+                    else:
+                        # still calculating (0.5 etc.)
+                        pm_up_won = None
+                if pm_up_won is None:
+                    # try down leg as well
+                    dn_px = await self.pm.resolved_leg_price(slug, "down")
+                    if dn_px is not None:
+                        if dn_px >= 0.99:
+                            pm_up_won = False
+                        elif dn_px <= 0.01:
+                            pm_up_won = True
         except Exception as e:
             logger.warning("PM resolution lookup failed: %s", e)
 
-        # Not ready yet — wait (caller retries each loop) unless timed out
-        if (pf_up_won is None or pm_up_won is None) and wait_s < 90:
+        # Not ready yet — wait up to 3 min (Gamma often lags 30–120s)
+        if (pf_up_won is None or pm_up_won is None) and wait_s < 180:
             logger.info(
-                "Hedge %s waiting resolution (t+%.0fs) pf=%s pm=%s",
+                "Hedge %s waiting resolution (t+%.0fs) pf=%s pm=%s slug=%s",
                 hedge.id, wait_s,
                 "Up" if pf_up_won else ("Down" if pf_up_won is False else "?"),
                 "Up" if pm_up_won else ("Down" if pm_up_won is False else "?"),
+                getattr(hedge, "pm_slug", "") or "?",
             )
             return
 
-        # Fallback to mid quotes only after timeout
+        # Fallback only after long timeout. Prefer matching the known venue;
+        # do NOT use current-window mid (books already moved to next market).
         if pf_up_won is None or pm_up_won is None:
-            ub, ua = self._pf_best(hedge.pf_leg.token_or_market, "up")
-            pm_ub, pm_ua = self._pm_best("up")
-            def _mid(b, a):
-                if b is not None and a is not None:
-                    return 0.5 * (b + a)
-                return b if b is not None else a
-            pf_mid = _mid(ub, ua)
-            pm_mid = _mid(pm_ub, pm_ua)
-            if pf_up_won is None and pf_mid is not None:
-                pf_up_won = pf_mid >= 0.5
-            if pm_up_won is None and pm_mid is not None:
-                pm_up_won = pm_mid >= 0.5
-            if pf_up_won is None:
+            if pf_up_won is None and pm_up_won is not None:
+                pf_up_won = pm_up_won
+            elif pm_up_won is None and pf_up_won is not None:
+                pm_up_won = pf_up_won  # assume same BTC outcome if PM Gamma lagging
+            elif pf_up_won is None and pm_up_won is None:
+                # both unknown — last resort true (Up)
                 pf_up_won = True
-            if pm_up_won is None:
-                pm_up_won = pf_up_won
+                pm_up_won = True
             logger.warning(
-                "Hedge %s resolution timeout — fallback pf_up=%s pm_up=%s",
-                hedge.id, pf_up_won, pm_up_won,
+                "Hedge %s resolution timeout — fallback pf_up=%s pm_up=%s (slug=%s)",
+                hedge.id, pf_up_won, pm_up_won, getattr(hedge, "pm_slug", ""),
             )
 
         if pf_up_won != pm_up_won:
