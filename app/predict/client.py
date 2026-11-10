@@ -533,21 +533,40 @@ class PredictClient:
             avg_f = 0.0
         if avg_f > 1.5:
             avg_f = avg_f / 1e18
-        # Some responses put cost as total USD in value-like fields — derive if needed
-        if (avg_f <= 0 or avg_f >= 1.0) and best_amt > 0:
-            for k in ("costUsd", "cost", "totalCost", "valueUsd"):
-                try:
-                    v = float(best.get(k) or 0)
-                except (TypeError, ValueError):
-                    continue
-                if v > 1.5:  # likely total notional
+        cost_usd = 0.0
+        for k in ("costBasisUsd", "costBasis", "costUsd", "totalCostUsd", "totalCost", "cost"):
+            try:
+                v = float(best.get(k) or 0)
+            except (TypeError, ValueError):
+                continue
+            if v > 0.01:
+                # wei-style or total USD
+                if v > best_amt * 2 and best_amt > 0:
+                    # maybe micro-units
+                    pass
+                cost_usd = v
+                if v > 1.5 and best_amt > 0 and v / best_amt < 1.5:
+                    # total notional in USD
                     cand = v / best_amt
                     if 0 < cand < 1.0:
                         avg_f = cand
-                        break
+                break
+        if (avg_f <= 0 or avg_f >= 1.0) and best_amt > 0 and cost_usd > 0:
+            cand = cost_usd / best_amt
+            if 0 < cand < 1.0:
+                avg_f = cand
+        # valueUsd is mark-to-market, NOT cost — only use if no avg
+        if (avg_f <= 0 or avg_f >= 1.0) and best_amt > 0:
+            try:
+                v = float(best.get("valueUsd") or 0)
+                if 0 < v < best_amt:  # value at entry-ish unlikely; skip MTM
+                    pass
+            except (TypeError, ValueError):
+                pass
         return {
             "shares": round(best_amt, 4),
             "avg_price": round(avg_f, 4) if 0 < avg_f < 1.5 else 0.0,
+            "cost_usd": round(cost_usd, 4) if cost_usd > 0 else 0.0,
             "value_usd": best.get("valueUsd"),
             "raw": best,
         }
@@ -568,15 +587,14 @@ class PredictClient:
         if not isinstance(rows, list):
             return None
         mid = str(market_id)
-        best_px = None
-        best_sh = 0.0
+        # Collect fills for VWAP (do NOT take lowest tick — that understates cost)
+        fills = []  # (px, sh, usd)
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            name = str(row.get("name") or row.get("type") or "").upper()
-            if "MATCH" not in name and "FILL" not in name and name not in ("MATCH_SUCCESS", "FILLED"):
-                # still accept rows with priceExecuted
-                if row.get("priceExecuted") is None and row.get("price") is None:
+            name = str(row.get("name") or row.get("type") or row.get("outcome") or "").upper()
+            if "MATCH" not in name and "FILL" not in name and "BUY" not in name and name not in ("MATCH_SUCCESS", "FILLED"):
+                if row.get("priceExecuted") is None and row.get("price") is None and row.get("value") is None:
                     continue
             m = row.get("market") if isinstance(row.get("market"), dict) else {}
             rid = str(m.get("id") or row.get("marketId") or "")
@@ -591,26 +609,44 @@ class PredictClient:
                 px = 0.0
             if px > 1.5:
                 px = px / 1e18
-            if not (0 < px < 1.5):
-                continue
-            raw_sh = row.get("amountFilled") or row.get("amount") or 0
+            raw_sh = row.get("amountFilled") or row.get("amount") or row.get("shares") or 0
             try:
                 sh = float(raw_sh)
             except (TypeError, ValueError):
                 sh = 0.0
             if sh > 1e12:
                 sh = sh / 1e18
-            # Prefer fill price strictly below our limit when limit was aggressive
-            if limit_price > 0 and px <= limit_price + 0.001:
-                if best_px is None or px < best_px:
-                    best_px = px
-                    best_sh = sh
-            elif best_px is None:
-                best_px = px
-                best_sh = sh
-        if best_px is None:
+            raw_usd = row.get("value") or row.get("valueUsd") or row.get("usd") or row.get("cost")
+            try:
+                usd = float(raw_usd) if raw_usd is not None else 0.0
+            except (TypeError, ValueError):
+                usd = 0.0
+            if usd > 0 and sh > 0 and not (0 < px < 1.5):
+                px = usd / sh
+            if not (0 < px < 1.5):
+                continue
+            if limit_price > 0 and px > limit_price + 0.05:
+                continue  # unrelated fill
+            if sh <= 0 and usd > 0 and px > 0:
+                sh = usd / px
+            fills.append((px, max(sh, 0.0), usd))
+        if not fills:
             return None
-        return {"avg_price": round(best_px, 4), "shares": round(best_sh, 4) if best_sh > 0 else 0.0}
+        # VWAP by shares; if USD known, prefer cost/shares
+        tot_sh = sum(s for _, s, _ in fills if s > 0)
+        tot_usd = sum(u for _, _, u in fills if u and u > 0)
+        if tot_usd > 0 and tot_sh > 0:
+            vwap = tot_usd / tot_sh
+        elif tot_sh > 0:
+            vwap = sum(p * s for p, s, _ in fills if s > 0) / tot_sh
+        else:
+            vwap = fills[0][0]
+            tot_sh = fills[0][1]
+        return {
+            "avg_price": round(float(vwap), 4),
+            "shares": round(float(tot_sh), 4) if tot_sh > 0 else 0.0,
+            "cost_usd": round(float(tot_usd), 4) if tot_usd > 0 else 0.0,
+        }
 
     async def place_order(
         self,

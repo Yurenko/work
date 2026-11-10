@@ -192,7 +192,18 @@
     const entry = Number(leg.entry_price);
     const exit = Number(leg.exit_price);
     const hasExit = closed && Number.isFinite(exit);
-    const pnl = hasExit ? (exit - entry) * shown : null;
+    const entryUsd = Number(leg.entry_usd || 0);
+    const exitUsd = Number(leg.exit_usd || 0);
+    let pnl = null;
+    if (hasExit) {
+      if (entryUsd > 0 || exitUsd > 0) {
+        const cost = entryUsd > 0 ? entryUsd : entry * shown;
+        const proceeds = exitUsd > 0 ? exitUsd : exit * shown;
+        pnl = proceeds - cost;
+      } else {
+        pnl = (exit - entry) * shown;
+      }
+    }
     const prices = hasExit ? `${fmt(entry)} → ${fmt(exit)}` : `${fmt(entry)}`;
     const pnlLine = pnl === null ? '' : `<div class="${pnl < 0 ? 'down' : 'up'}">${money(pnl)}</div>`;
     const result = leg.result ? `<div class="muted">result ${String(leg.result).toUpperCase()}</div>` : '';
