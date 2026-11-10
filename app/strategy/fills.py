@@ -69,34 +69,56 @@ fill_from_binance_place = fill_from_predict
 fill_from_binance_row = fill_from_predict
 
 
-def fill_from_pm_order(resp: Any, requested: float = 0.0) -> Fill:
+def fill_from_pm_order(resp: Any, requested: float = 0.0, side: str = "BUY") -> Fill:
     """Parse Polymarket CLOB post_order response.
 
-    Matched example:
-      takingAmount = shares received (BUY)
-      makingAmount = USDC spent
-      avg = making / taking
+    BUY  matched: takingAmount=shares received, makingAmount=USDC spent
+                  price = making/taking, shares=taking, usd=making
+    SELL matched: makingAmount=shares sold,     takingAmount=USDC received
+                  price = taking/making, shares=making, usd=taking
     """
     if not isinstance(resp, dict):
         return Fill(status="REJECTED", reason="empty response")
     status = str(resp.get("status") or "").upper()
     oid = str(resp.get("orderID") or resp.get("orderId") or resp.get("id") or "")
     reason = str(resp.get("reason") or resp.get("error") or resp.get("errorMsg") or "")
+    side_u = (side or "BUY").upper()
 
     taking = _num(resp.get("takingAmount") or resp.get("size_matched") or resp.get("filledShares") or resp.get("filled"))
     making = _num(resp.get("makingAmount") or resp.get("usd"))
     limit_px = _num(resp.get("avgPrice") or resp.get("price")) or 0.0
 
-    shares = taking or 0.0
+    shares = 0.0
     price = limit_px
     usd = 0.0
     if taking and taking > 0 and making and making > 0:
-        # Real average fill
-        price = making / taking
+        if side_u == "SELL":
+            # maker gives shares, taker gives USDC
+            shares = making
+            usd = taking
+            price = taking / making if making else 0.0
+        else:
+            shares = taking
+            usd = making
+            price = making / taking if taking else 0.0
+        # Safety: outcome prices live in (0, 1.5]; if inverted, swap interpretation
+        if price > 1.5 and side_u == "BUY":
+            # probably was a sell-shaped response
+            shares, usd = making, taking
+            price = taking / making if making else price
+        if price > 1.5 and side_u == "SELL":
+            shares, usd = taking, making
+            price = making / taking if taking else price
+    elif taking and taking > 0:
         shares = taking
-        usd = making
-    elif shares > 0 and price > 0:
-        usd = shares * price
+        if price > 0:
+            usd = shares * price
+    elif making and making > 0 and side_u == "SELL":
+        shares = making
+
+    # Clamp display price into sane band for binary markets
+    if price > 1.5:
+        price = min(price, 1.5)
 
     if status in ("FILLED", "MATCHED"):
         if shares <= 0:

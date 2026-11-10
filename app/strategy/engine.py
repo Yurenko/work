@@ -764,13 +764,18 @@ class HedgeEngine:
             )
 
     async def _try_exit(self, hedge: Hedge, now: float) -> None:
-        """Early exit when sum of bids >= exit_sum_min (sell both legs at market).
+        """Early exit when sum of bids >= exit_sum_min AND beats entry (sell both).
 
-        Exit prices are live bids in (0,1), NOT 0/1 settlement. Example:
-        UP bought @0.40 can sell @0.11 if market moved — that is intentional.
+        Exit prices are live bids in (0,1), NOT 0/1 settlement.
         """
-        # Don't early-exit in last 15s — let settlement handle it
-        if now >= hedge.market_end - 15:
+        # Don't early-exit in last 20s — let settlement handle it
+        if now >= hedge.market_end - 20:
+            return
+        # Min hold 25s — avoid EXIT 1s after fill on noisy books / partial promote
+        age = now - float(hedge.opened_at or now)
+        if age < 25.0:
+            return
+        if hedge.status != "OPEN":
             return
         pf_bid, _ = self._pf_best(hedge.pf_leg.token_or_market, hedge.pf_leg.direction)
         pm_bid, _ = self._pm_best(hedge.pm_leg.direction)
@@ -782,9 +787,13 @@ class HedgeEngine:
         s = pf_bid + pm_bid
         if s < self.settings.exit_sum_min:
             return
+        # Must improve on actual entry — otherwise we lock a worse loss than holding to settle
+        entry = float(hedge.entry_sum or 0)
+        if entry > 0 and s < entry + 0.02:
+            return
         logger.info(
-            "EXIT signal hedge=%s sum=%.3f pf_bid=%.3f pm_bid=%.3f (market sell, not settle)",
-            hedge.id, s, pf_bid, pm_bid,
+            "EXIT signal hedge=%s sum=%.3f entry=%.3f pf_bid=%.3f pm_bid=%.3f (market sell)",
+            hedge.id, s, entry, pf_bid, pm_bid,
         )
         hedge.exit_sum = s
         hedge.close_reason = "EXIT"
@@ -822,8 +831,8 @@ class HedgeEngine:
             except Exception as e:
                 logger.debug("%s position lookup for sell: %s", label, e)
 
-            # Floor to 4dp — never oversell
-            size = max(0.0, int(size * 10000) / 10000.0)
+            # Floor to 4dp and haircut 1% — chain balance often lags fill by a few seconds
+            size = max(0.0, int(size * 0.99 * 10000) / 10000.0)
 
             # Dust below min notional (~$1 at typical prices) — cannot sell, mark closed
             bid, _ = self._pf_best(leg.token_or_market, leg.direction)
@@ -885,9 +894,13 @@ class HedgeEngine:
                 leg.reject_reason = fill.reason or ""
                 logger.warning("%s sell rejected: %s", label, fill.reason)
                 if "insufficient" in reason and "share" in reason:
-                    leg.status = "CLOSED"
-                    leg.exit_price = leg.exit_price or 0.0
-                    logger.info("%s sell: insufficient shares — mark CLOSED", label)
+                    # Shrink tracked size slightly for next retry; do NOT mark CLOSED
+                    # while position may still exist (fee/rounding lag)
+                    leg.filled_shares = max(0.0, float(leg.filled_shares or 0) * 0.98)
+                    logger.info(
+                        "%s sell: insufficient — shrink tracked to %.4f, will retry",
+                        label, leg.filled_shares,
+                    )
             return
 
         # Polymarket
@@ -897,19 +910,18 @@ class HedgeEngine:
             leg.status = "CLOSED"
             return
         resp = await self.pm.place_market_sell(leg.token_or_market, size, px)
-        fill = fill_from_pm_order(resp, size)
+        fill = fill_from_pm_order(resp, size, side="SELL")
         if fill.status == "FILLED":
             leg.status = "CLOSED"
-            leg.exit_price = fill.price
+            leg.exit_price = min(1.0, max(0.0, float(fill.price or 0)))
             leg.exit_usd = fill.usd
         elif fill.status == "REJECTED":
             reason = (fill.reason or "").lower()
             leg.reject_reason = fill.reason or ""
             logger.warning("%s sell rejected: %s", label, fill.reason)
-            if "insufficient" in reason and "share" in reason:
-                leg.status = "CLOSED"
-                leg.exit_price = leg.exit_price or 0.0
-                logger.info("%s sell: insufficient shares — mark CLOSED, settle at end", label)
+            if "insufficient" in reason or "not enough balance" in reason:
+                # Chain lag right after buy is common — retry later, do not fake-close
+                logger.info("%s sell: balance lag — will retry (not marking CLOSED)", label)
 
     async def _finish_exit(self, hedge: Hedge, now: float) -> None:
         # Throttle sell attempts (avoid 1Hz spam when market closed)
@@ -949,6 +961,10 @@ class HedgeEngine:
             pf_pnl = _leg_pnl_exit(hedge.pf_leg)
             pm_pnl = _leg_pnl_exit(hedge.pm_leg)
             hedge.pnl = pf_pnl + pm_pnl
+            # Binary market prices must stay in [0, 1]
+            for leg in (hedge.pf_leg, hedge.pm_leg):
+                if leg.exit_price is not None:
+                    leg.exit_price = min(1.0, max(0.0, float(leg.exit_price)))
             hedge.exit_sum = float(hedge.pf_leg.exit_price or 0) + float(hedge.pm_leg.exit_price or 0)
             hedge.close_reason = hedge.close_reason or "EXIT"
             hedge.status = "CLOSED"
