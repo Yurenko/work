@@ -578,35 +578,43 @@ class PredictClient:
                 best = row
         if not best:
             return None
-        avg = best.get("averageBuyPriceUsd") or best.get("averageBuyPrice") or best.get("avgPrice")
+        avg = best.get("averageBuyPriceUsd") or best.get("averageBuyPrice") or best.get("avgPrice") or best.get("avgCost")
         try:
             avg_f = float(avg) if avg is not None else 0.0
         except (TypeError, ValueError):
             avg_f = 0.0
-        if avg_f > 1.5:
+        # Cents style (43 = 0.43) or wei
+        if 1.5 < avg_f <= 100:
+            avg_f = avg_f / 100.0
+        elif avg_f > 100:
             avg_f = avg_f / 1e18
         cost_usd = 0.0
-        for k in ("costBasisUsd", "costBasis", "costUsd", "totalCostUsd", "totalCost", "cost"):
+        for k in ("costBasisUsd", "costBasis", "costUsd", "totalCostUsd", "totalCost", "cost", "invested"):
             try:
                 v = float(best.get(k) or 0)
             except (TypeError, ValueError):
                 continue
-            if v > 0.01:
-                # wei-style or total USD
-                if v > best_amt * 2 and best_amt > 0:
-                    # maybe micro-units
-                    pass
-                cost_usd = v
-                if v > 1.5 and best_amt > 0 and v / best_amt < 1.5:
-                    # total notional in USD
-                    cand = v / best_amt
-                    if 0 < cand < 1.0:
-                        avg_f = cand
-                break
+            if v <= 0:
+                continue
+            # Normalize possible cents / micro
+            if best_amt > 0 and v / best_amt > 1.5:
+                for div in (100.0, 1e6, 1e18):
+                    if 0.01 <= (v / div) / best_amt <= 1.0:
+                        v = v / div
+                        break
+            cost_usd = v
+            if best_amt > 0:
+                cand = cost_usd / best_amt
+                if 0.01 <= cand <= 1.0:
+                    avg_f = cand
+            break
         if (avg_f <= 0 or avg_f >= 1.0) and best_amt > 0 and cost_usd > 0:
             cand = cost_usd / best_amt
-            if 0 < cand < 1.0:
+            if 0.01 <= cand <= 1.0:
                 avg_f = cand
+        # Derive cost from avg if API only gave averageBuyPriceUsd
+        if cost_usd <= 0 and best_amt > 0 and 0.01 <= avg_f <= 1.0:
+            cost_usd = avg_f * best_amt
         # valueUsd is mark-to-market, NOT cost — only use if no avg
         if (avg_f <= 0 or avg_f >= 1.0) and best_amt > 0:
             try:
@@ -658,6 +666,11 @@ class PredictClient:
             rid = str(m.get("id") or row.get("marketId") or "")
             if rid and rid != mid:
                 continue
+            # Prefer BUY / MATCH fills for entry cost (skip sells)
+            side = str(row.get("side") or row.get("orderSide") or row.get("type") or "").upper()
+            title = str(row.get("title") or row.get("action") or "").upper()
+            if any(x in side or x in title for x in ("SELL", "ASK", "REDEEM", "CLAIM")):
+                continue
             raw_px = row.get("priceExecuted") or row.get("price")
             if isinstance(row.get("order"), dict) and raw_px is None:
                 raw_px = row["order"].get("price")
@@ -677,13 +690,29 @@ class PredictClient:
                 sh = 0.0
             if sh > 1e12:
                 sh = sh / 1e18
-            raw_usd = row.get("value") or row.get("valueUsd") or row.get("usd") or row.get("cost")
+            raw_usd = (
+                row.get("value")
+                or row.get("valueUsd")
+                or row.get("usd")
+                or row.get("cost")
+                or row.get("quoteAmount")
+                or row.get("notional")
+            )
             try:
                 usd = float(raw_usd) if raw_usd is not None else 0.0
             except (TypeError, ValueError):
                 usd = 0.0
-            if usd > 0 and sh > 0 and not (0 < px < 1.5):
-                px = usd / sh
+            # Value on UI is dollars; sometimes micro-units
+            if usd > 1000 and sh > 0:
+                # likely wei or micro
+                for div in (1e18, 1e6, 100.0):
+                    if 0.01 <= (usd / div) / max(sh, 1e-9) <= 1.0:
+                        usd = usd / div
+                        break
+            if usd > 0 and sh > 0:
+                cand = usd / sh
+                if 0.01 <= cand <= 1.0:
+                    px = cand  # cost/shares overrides tick
             if not (0 < px < 1.5):
                 continue
             if limit_price > 0 and px > limit_price + 0.05:

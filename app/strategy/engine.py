@@ -504,7 +504,9 @@ class HedgeEngine:
 
         self._apply_fill(hedge.pf_leg, pf_fill)
 
-        # Reconcile PF shares + REAL avg cost (prefer cost_usd / activity VWAP, not min tick)
+        # Reconcile PF shares + REAL avg cost.
+        # Priority: activity cost_usd > positions cost_usd > activity VWAP > pos avg > limit.
+        # NEVER prefer "closer to limit" — limit is a ceiling, fill is usually better.
         if pf_fill.status == "FILLED" and self.settings.is_live:
             try:
                 import asyncio as _asyncio
@@ -512,60 +514,67 @@ class HedgeEngine:
                 real_sh = float(pf_fill.shares or 0)
                 real_px = 0.0
                 real_usd = 0.0
-                for attempt in range(3):
-                    await _asyncio.sleep(0.55 + attempt * 0.45)
-                    pos = await self.pf.get_position_for_market(pf_m["id"])
-                    if pos and pos.get("shares", 0) > 0:
+                src = "fill"
+                is_yes = hedge.pf_leg.direction == "up"
+                for attempt in range(4):
+                    await _asyncio.sleep(0.4 + attempt * 0.5)
+                    # 1) Positions API (correct outcome side)
+                    try:
+                        pos = await self.pf.get_position_for_market(pf_m["id"], is_yes=is_yes)
+                    except TypeError:
+                        pos = await self.pf.get_position_for_market(pf_m["id"])
+                    if pos and float(pos.get("shares") or 0) > 0:
                         real_sh = float(pos["shares"]) or real_sh
-                        ap = float(pos.get("avg_price") or 0)
                         cu = float(pos.get("cost_usd") or 0)
-                        if cu > 0 and real_sh > 0:
-                            # cost basis is the most trustworthy
-                            real_usd = cu
-                            real_px = cu / real_sh
-                        elif 0 < ap < 1.0 and (lim <= 0 or ap <= lim + 0.01):
-                            # only accept pos avg if not suspiciously far below limit
-                            # (API sometimes returns stale/wrong low avg)
-                            if real_px <= 0 or abs(ap - lim) < abs(real_px - lim):
-                                real_px = ap
+                        ap = float(pos.get("avg_price") or 0)
+                        if cu > 0.01 and real_sh > 0:
+                            # If API returned cents-style cost, normalize
+                            if cu / real_sh > 1.5 and cu > 50:
+                                cu = cu / 100.0
+                            cand = cu / real_sh
+                            if 0.01 <= cand <= 1.0:
+                                real_usd = cu
+                                real_px = cand
+                                src = "positions_cost"
+                        elif 0.01 <= ap <= 1.0 and real_px <= 0:
+                            real_px = ap
+                            src = "positions_avg"
+                    # 2) Activity fills (Value $ / priceExecuted)
                     act = await self.pf.get_fill_price_from_activity(
                         pf_m["id"], order_id=pf_fill.order_id or "", limit_price=lim,
                     )
                     if act:
-                        ap = float(act.get("avg_price") or 0)
                         cu = float(act.get("cost_usd") or 0)
-                        if cu > 0 and real_sh > 0:
-                            # activity total value preferred
-                            if real_usd <= 0 or cu > real_usd * 0.95:
+                        ap = float(act.get("avg_price") or 0)
+                        ash = float(act.get("shares") or 0)
+                        if ash > 0:
+                            real_sh = ash or real_sh
+                        if cu > 0.01 and real_sh > 0:
+                            if cu / real_sh > 1.5 and cu > 50:
+                                cu = cu / 100.0
+                            cand = cu / real_sh
+                            if 0.01 <= cand <= 1.0:
+                                # activity Value is the ground truth from UI
                                 real_usd = cu
-                                real_px = cu / max(real_sh, float(act.get("shares") or real_sh) or 1)
-                        elif 0 < ap < 1.0:
-                            # VWAP from activity — do not take min of sources
-                            if real_px <= 0:
-                                real_px = ap
-                            elif abs(ap - lim) < abs(real_px - lim):
-                                # closer to limit is often more accurate than a suspiciously low tick
-                                real_px = ap
-                    if real_px > 0 and (lim <= 0 or real_px <= lim + 0.01 or attempt == 2):
+                                real_px = cand
+                                src = "activity_cost"
+                        elif 0.01 <= ap <= 1.0 and src not in ("positions_cost", "activity_cost"):
+                            real_px = ap
+                            src = "activity_vwap"
+                    # Stop early once we have a cost basis
+                    if src in ("positions_cost", "activity_cost") and real_px > 0:
+                        break
+                    if real_px > 0 and attempt >= 2:
                         break
                 if real_px <= 0:
-                    real_px = float(pf_fill.price or 0)
-                # Prefer any positive cost_usd from activity/positions
-                if real_usd > 0 and real_sh > 0:
-                    real_px = real_usd / real_sh
-                # Only reject low avg when we have NO usd confirmation at all
-                elif lim > 0 and real_px > 0 and real_px < lim * 0.70:
-                    logger.warning(
-                        "PF reconcile avg %.4f << limit %.4f without cost_usd — keep fill/limit",
-                        real_px, lim,
-                    )
-                    real_px = float(pf_fill.price or lim)
+                    real_px = float(pf_fill.price or lim or 0)
+                    src = "limit_fallback"
                 if real_usd <= 0 and real_sh > 0 and real_px > 0:
                     real_usd = real_sh * real_px
                 if real_sh > 0 and real_px > 0:
                     logger.info(
-                        "PF reconcile market=%s shares=%.4f→%.4f avg=%.4f→%.4f usd=%.4f (limit was %.4f)",
-                        pf_m["id"], pf_fill.shares, real_sh, pf_fill.price, real_px, real_usd, lim,
+                        "PF reconcile market=%s shares=%.4f→%.4f avg=%.4f→%.4f usd=%.4f src=%s (limit was %.4f)",
+                        pf_m["id"], pf_fill.shares, real_sh, pf_fill.price, real_px, real_usd, src, lim,
                     )
                     pf_fill = Fill(
                         status="FILLED",
@@ -573,7 +582,7 @@ class HedgeEngine:
                         price=round(real_px, 4),
                         usd=round(real_usd, 4),
                         order_id=pf_fill.order_id,
-                        order_hash=getattr(pf_fill, "order_hash", "") or "",
+                        order_hash=pf_fill.order_hash,
                     )
                     self._apply_fill(hedge.pf_leg, pf_fill)
             except Exception as e:
@@ -1097,7 +1106,13 @@ class HedgeEngine:
         self._refresh_entry_sum(hedge)
         if self.settings.is_live:
             try:
-                pos = await self.pf.get_position_for_market(hedge.pf_leg.token_or_market)
+                is_yes = hedge.pf_leg.direction == "up"
+                try:
+                    pos = await self.pf.get_position_for_market(
+                        hedge.pf_leg.token_or_market, is_yes=is_yes,
+                    )
+                except TypeError:
+                    pos = await self.pf.get_position_for_market(hedge.pf_leg.token_or_market)
                 if pos and pos.get("shares", 0) > 0:
                     sh = float(pos["shares"])
                     ap = float(pos.get("avg_price") or 0)
@@ -1105,12 +1120,14 @@ class HedgeEngine:
                     if cu <= 0 and ap > 0:
                         cu = sh * ap
                     if sh > 0 and (ap > 0 or cu > 0):
-                        hedge.pf_leg.filled_shares = sh
-                        hedge.pf_leg.shares = sh
-                        if cu > 0:
+                        # Only update if new cost is lower or we had no cost (better fill truth)
+                        old_usd = float(hedge.pf_leg.entry_usd or 0)
+                        if cu > 0 and (old_usd <= 0 or cu < old_usd * 1.02 or abs(cu - old_usd) / max(old_usd, 1e-9) > 0.05):
+                            hedge.pf_leg.filled_shares = sh
+                            hedge.pf_leg.shares = sh
                             hedge.pf_leg.entry_usd = cu
                             hedge.pf_leg.entry_price = cu / sh
-                        elif ap > 0:
+                        elif ap > 0 and old_usd <= 0:
                             hedge.pf_leg.entry_price = ap
                             hedge.pf_leg.entry_usd = sh * ap
                         logger.info(
