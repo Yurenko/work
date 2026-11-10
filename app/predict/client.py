@@ -532,8 +532,13 @@ class PredictClient:
             logger.debug("PF balance fetch failed: %s", e)
             return None
 
-    async def get_position_for_market(self, market_id: str | int) -> dict | None:
-        """GET /v1/positions?marketId= — amount (shares) + averageBuyPriceUsd (real cost)."""
+    async def get_position_for_market(
+        self, market_id: str | int, is_yes: bool | None = None
+    ) -> dict | None:
+        """GET /v1/positions?marketId= — amount (shares) + averageBuyPriceUsd (real cost).
+
+        is_yes: if set, only return the YES or NO outcome position.
+        """
         data = await self._request(
             "GET",
             "/v1/positions",
@@ -550,6 +555,17 @@ class PredictClient:
         for row in rows:
             if not isinstance(row, dict):
                 continue
+            if is_yes is not None:
+                # Filter by outcome / isYes / outcomeName
+                row_yes = row.get("isYes")
+                if row_yes is None:
+                    name = str(row.get("outcome") or row.get("outcomeName") or row.get("name") or "").lower()
+                    if name in ("yes", "up"):
+                        row_yes = True
+                    elif name in ("no", "down"):
+                        row_yes = False
+                if row_yes is not None and bool(row_yes) != bool(is_yes):
+                    continue
             raw = row.get("amount") or 0
             try:
                 amt = float(raw)
