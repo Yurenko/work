@@ -622,10 +622,11 @@ class HedgeEngine:
                 self.pf_entry_cooldown_until = now + 8.0
             return
 
-        # PM size ≈ PF shares (equal share hedge). Prefer original target when
-        # reconcile only differs by fee dust (~2%), so quantize stays clean (e.g. 6.0 not 6.1224).
+        # PM size = actual PF net shares (after fee). Do NOT snap up to target —
+        # that caused PM 6.0/6.16 while PF held 5.99.
         filled = float(pf_fill.shares) if pf_fill.shares > 0 else float(shares)
-        if shares > 0 and filled > 0 and abs(filled - float(shares)) / float(shares) <= 0.04:
+        # Prefer the lower of fill vs target (never buy more on PM than PF net)
+        if shares > 0 and filled > float(shares):
             filled = float(shares)
         hedge.pm_leg.requested_shares = filled
         if hedge.pm_leg.order_id and hedge.pm_leg.status in ("FILLED", "SUBMITTED"):
@@ -658,7 +659,7 @@ class HedgeEngine:
             except Exception:
                 pass
             # Retry once: same shares, ask+2¢ so FOK can take more book depth
-            retry_ask = min(0.99, float(pm_ask) + 0.02)
+            retry_ask = min(0.99, float(pm_ask) + 0.01)
             logger.info("PM BUY FOK retry shares=%.4f ask=%.4f→%.4f", filled, pm_ask, retry_ask)
             pm_resp2 = await self.pm.place_market_buy(str(pm_token), filled, retry_ask)
             pm_fill = fill_from_pm_order(pm_resp2, filled)
@@ -1303,20 +1304,28 @@ class HedgeEngine:
                     cu = float(pos.get("cost_usd") or 0)
                     if cu <= 0 and ap > 0:
                         cu = sh * ap
+                    tracked = float(hedge.pf_leg.filled_shares or 0)
                     if sh > 0 and (ap > 0 or cu > 0):
-                        # Only update if new cost is lower or we had no cost (better fill truth)
                         old_usd = float(hedge.pf_leg.entry_usd or 0)
-                        if cu > 0 and (old_usd <= 0 or cu < old_usd * 1.02 or abs(cu - old_usd) / max(old_usd, 1e-9) > 0.05):
-                            hedge.pf_leg.filled_shares = sh
-                            hedge.pf_leg.shares = sh
-                            hedge.pf_leg.entry_usd = cu
-                            hedge.pf_leg.entry_price = cu / sh
+                        # Price/avg only — never expand shares beyond this hedge
+                        if cu > 0 and tracked > 0 and sh > tracked * 1.08:
+                            new_px = cu / sh
+                            if 0.01 <= new_px <= 1.0:
+                                hedge.pf_leg.entry_price = new_px
+                                hedge.pf_leg.entry_usd = tracked * new_px
+                        elif cu > 0 and (old_usd <= 0 or abs(cu - old_usd) / max(old_usd, 1e-9) > 0.05):
+                            if tracked <= 0 or sh <= tracked * 1.08:
+                                hedge.pf_leg.filled_shares = sh
+                                hedge.pf_leg.shares = sh
+                                hedge.pf_leg.entry_usd = cu
+                                hedge.pf_leg.entry_price = cu / sh
                         elif ap > 0 and old_usd <= 0:
                             hedge.pf_leg.entry_price = ap
-                            hedge.pf_leg.entry_usd = sh * ap
+                            hedge.pf_leg.entry_usd = (tracked or sh) * ap
                         logger.info(
-                            "PF settle-reconcile shares=%.4f avg=%.4f usd=%.4f",
-                            sh, hedge.pf_leg.entry_price, hedge.pf_leg.entry_usd,
+                            "PF settle-reconcile shares=%.4f avg=%.4f usd=%.4f tracked=%.4f",
+                            hedge.pf_leg.filled_shares, hedge.pf_leg.entry_price,
+                            hedge.pf_leg.entry_usd, tracked,
                         )
             except Exception as e:
                 logger.warning("PF settle-reconcile failed: %s", e)
