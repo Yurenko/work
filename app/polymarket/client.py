@@ -38,12 +38,35 @@ def _ceil_dec(value: float, decimals: int) -> float:
     return math.ceil(value * f - 1e-12) / f
 
 
+def _quantize_buy_size(size: float, limit: float) -> float:
+    """Largest size ≤ target with ≤4dp such that size*limit has ≤2dp (maker USDC rule).
+
+    CLOB rejects: maker amount max 2 decimals, taker (shares) max 4.
+    size_units (1e-4) * limit_cents must be divisible by 10000.
+    """
+    if size <= 0 or limit <= 0:
+        return 0.0
+    limit_cents = int(round(float(limit) * 100))
+    if limit_cents <= 0:
+        return 0.0
+    # size in 1e-4 units
+    units = int(math.floor(float(size) * 10000 + 1e-9))
+    while units > 0:
+        # product_cents = units * limit_cents / 10000 must be integer
+        if (units * limit_cents) % 10000 == 0:
+            return units / 10000.0
+        units -= 1
+    return 0.0
+
+
 def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float]:
     """Equal-share BUY size for Polymarket CLOB.
 
-    Primary rule: size == target_shares (match Predict.fun).
+    Primary rule: size ≈ target_shares (match Predict.fun).
     Only if target_shares * ask < $1.05 (CLOB min), bump size so cost at ask
-    is ~$1.20 and never more than $1.50. Never inflate just because limit > ask.
+    is ~$1.20 and never more than $1.50.
+    Always quantize so size*limit is exact cents (maker 2dp) — otherwise
+    CLOB returns 400 invalid amounts.
     """
     MIN_USD = 1.05
     BUMP_USD = 1.20
@@ -51,43 +74,30 @@ def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float
     if ask is None or ask <= 0 or target_shares is None or target_shares <= 0:
         return 0.0, 0.0
     ask = float(ask)
-    # Limit a tick above ask so FOK crosses; size still based on equal shares
     limit = min(0.99, _ceil_dec(ask + 0.01, 2))
     if limit < 0.01:
         limit = 0.01
 
     size = float(target_shares)
     cost_at_ask = size * ask
-    bumped = False
     if cost_at_ask < MIN_USD:
-        # Must meet CLOB min notional — inflate shares only up to ~$1.20–$1.50
-        bumped = True
         size = BUMP_USD / ask
         if size * limit > MAX_BUMP_USD:
             size = MAX_BUMP_USD / limit
         if size * ask > MAX_BUMP_USD:
             size = MAX_BUMP_USD / ask
 
-    size = _floor_dec(size, 4)
-    # Snap size so size*limit is exact cents (maker amount 2dp rule)
-    for _ in range(10):
-        mc = int(math.floor(size * limit * 100 + 1e-9))
-        if bumped and mc < int(MIN_USD * 100):
-            mc = int(math.ceil(MIN_USD * 100))
-            size = _floor_dec(mc / 100.0 / limit + 1e-12, 4)
-            if size * limit > MAX_BUMP_USD + 0.02:
-                size = _floor_dec(MAX_BUMP_USD / limit, 4)
-            continue
-        if not bumped:
-            # Keep equal shares; do not force min via size inflation here
-            # (if under $1 CLOB will reject and engine can retry)
-            break
-        if abs(size * limit - mc / 100.0) < 1e-9:
-            break
-        size = _floor_dec(mc / 100.0 / limit, 4)
-        if size <= 0:
-            size = _floor_dec(MIN_USD / limit, 4)
-            break
+    size = _quantize_buy_size(size, limit)
+    if size <= 0:
+        # fallback: try from min notional upward
+        for cents in range(int(math.ceil(MIN_USD * 100)), int(MAX_BUMP_USD * 100) + 1):
+            raw = (cents / 100.0) / limit
+            q = _quantize_buy_size(raw, limit)
+            if q > 0 and q * limit + 1e-9 >= MIN_USD:
+                size = q
+                break
+    if size <= 0:
+        return 0.0, 0.0
     return limit, size
 
 
@@ -429,14 +439,12 @@ class PolymarketClient:
             limit, size = polymarket_buy_order(shares, ask)
             if size <= 0 or limit <= 0:
                 return {"status": "REJECTED", "reason": "no Polymarket ask / zero size"}
-            # Hard cap: never order more than ~15% above target unless min-notional bump
-            if size > shares * 1.15 and shares * ask >= 1.05:
-                size = _floor_dec(shares, 4)
-                limit = min(0.99, _ceil_dec(ask + 0.01, 2))
+            # size already quantized so size*limit is exact cents (maker 2dp)
+            maker = round(size * limit, 2)
             logger.info(
-                "PM BUY target %.4f sh ask %.4f → limit %.2f size %.4f (budget $%.2f)%s",
-                shares, ask, limit, size, size * limit,
-                " [min-notional bump]" if size > shares * 1.02 else "",
+                "PM BUY target %.4f sh ask %.4f → limit %.2f size %.4f maker=$%.2f%s",
+                shares, ask, limit, size, maker,
+                " [min-notional bump]" if (shares * ask < 1.05 and size > shares * 1.02) else "",
             )
             order_side = BUY
             px, sz = limit, size

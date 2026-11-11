@@ -610,8 +610,11 @@ class HedgeEngine:
                 self.pf_entry_cooldown_until = now + 8.0
             return
 
-        # PM size = *actual net* PF shares (equal share hedge, not equal $)
-        filled = float(pf_fill.shares) if pf_fill.shares > 0 else shares
+        # PM size ≈ PF shares (equal share hedge). Prefer original target when
+        # reconcile only differs by fee dust (~2%), so quantize stays clean (e.g. 6.0 not 6.1224).
+        filled = float(pf_fill.shares) if pf_fill.shares > 0 else float(shares)
+        if shares > 0 and filled > 0 and abs(filled - float(shares)) / float(shares) <= 0.04:
+            filled = float(shares)
         hedge.pm_leg.requested_shares = filled
         if hedge.pm_leg.order_id and hedge.pm_leg.status in ("FILLED", "SUBMITTED"):
             logger.warning("PM leg already has order %s — skip second place", hedge.pm_leg.order_id[:18])
