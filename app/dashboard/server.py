@@ -73,6 +73,18 @@ async def health() -> dict:
     return {"ok": True, "mode": get_settings().mode}
 
 
+@app.post("/api/reset-recovery")
+async def reset_recovery() -> dict:
+    """Clear recovery debt / next size back to base (after false loss settle)."""
+    eng = get_engine()
+    eng.recovery.reset()
+    return {
+        "ok": True,
+        "recovery_debt": eng.recovery.recovery_debt,
+        "next_shares": eng.recovery.current_shares,
+    }
+
+
 @app.on_event("startup")
 async def startup() -> None:
     settings = get_settings()

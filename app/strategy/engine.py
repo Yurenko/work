@@ -857,6 +857,24 @@ class HedgeEngine:
                 _, ask = self._pm_best(hedge.pm_leg.direction)
                 size = float(hedge.pf_leg.filled_shares or hedge.pf_leg.requested_shares or 0)
                 if ask and size > 0:
+                    # Do NOT chase a worse PM price after PF already filled.
+                    # Abort the pair if combined entry would exceed ENTRY_SUM_MAX + small slack.
+                    pf_px = float(hedge.pf_leg.entry_price or 0)
+                    projected = pf_px + float(ask)
+                    max_ok = float(self.settings.entry_sum_max) + 0.03  # 3¢ slack for fee/slip
+                    if pf_px > 0 and projected > max_ok:
+                        logger.warning(
+                            "Hedge %s ABORT PM retry: projected entry_sum=%.3f "
+                            "(pf@%.3f + pm_ask@%.3f) > max %.3f — leave PARTIAL, no chase",
+                            hedge.id, projected, pf_px, float(ask), max_ok,
+                        )
+                        hedge.pm_leg.status = "REJECTED"
+                        hedge.pm_leg.reject_reason = (
+                            f"retry ask too high ({projected:.3f} > {max_ok:.3f})"
+                        )
+                        # Mark closed as aborted loss on PF only so recovery sees real PF loss
+                        # but do NOT promote to OPEN with bad sum.
+                        return
                     if hedge.pm_leg.order_id and hedge.pm_leg.status == "SUBMITTED":
                         try:
                             await self.pm.cancel_order(hedge.pm_leg.order_id)
@@ -876,8 +894,18 @@ class HedgeEngine:
                     self._apply_fill(hedge.pm_leg, fill)
 
         if hedge.pf_leg.status == "FILLED" and hedge.pm_leg.status == "FILLED":
-            hedge.status = "OPEN"
             self._refresh_entry_sum(hedge)
+            max_ok = float(self.settings.entry_sum_max) + 0.05
+            if hedge.entry_sum > max_ok:
+                logger.warning(
+                    "Hedge %s NOT promoting to OPEN: entry_sum=%.3f > %.3f "
+                    "(PF %.2f@%.3f + PM %.2f@%.3f) — bad fill, keep PARTIAL",
+                    hedge.id, hedge.entry_sum, max_ok,
+                    hedge.pf_leg.filled_shares, hedge.pf_leg.entry_price,
+                    hedge.pm_leg.filled_shares, hedge.pm_leg.entry_price,
+                )
+                return
+            hedge.status = "OPEN"
             logger.info(
                 "Hedge %s promoted PARTIAL→OPEN entry_sum=%.3f PF %.2f@%.3f PM %.2f@%.3f",
                 hedge.id, hedge.entry_sum,
@@ -1302,9 +1330,13 @@ class HedgeEngine:
             if slug:
                 up_px = await self.pm.resolved_leg_price(slug, "up")
                 if up_px is not None:
-                    if up_px >= 0.99:
+                    logger.info(
+                        "PM resolution slug=%s up_px=%.4f (hedge=%s)",
+                        slug, up_px, hedge.id,
+                    )
+                    if up_px >= 0.95:
                         pm_up_won = True
-                    elif up_px <= 0.01:
+                    elif up_px <= 0.05:
                         pm_up_won = False
                     else:
                         # still calculating (0.5 etc.)
@@ -1313,9 +1345,13 @@ class HedgeEngine:
                     # try down leg as well
                     dn_px = await self.pm.resolved_leg_price(slug, "down")
                     if dn_px is not None:
-                        if dn_px >= 0.99:
+                        logger.info(
+                            "PM resolution slug=%s dn_px=%.4f (hedge=%s)",
+                            slug, dn_px, hedge.id,
+                        )
+                        if dn_px >= 0.95:
                             pm_up_won = False
-                        elif dn_px <= 0.01:
+                        elif dn_px <= 0.05:
                             pm_up_won = True
         except Exception as e:
             logger.warning("PM resolution lookup failed: %s", e)
@@ -1335,39 +1371,61 @@ class HedgeEngine:
                 )
             return
 
-        # Fallback only after long timeout. Prefer matching the known venue;
-        # do NOT use current-window mid (books already moved to next market).
-        if pf_up_won is None or pm_up_won is None:
-            # One last PM attempt with explicit log of raw outcomePrices
-            if pm_up_won is None:
-                slug = str(getattr(hedge, "pm_slug", "") or "")
-                if slug:
-                    try:
-                        up_px = await self.pm.resolved_leg_price(slug, "up")
-                        logger.info("PM final resolution slug=%s up_px=%s", slug, up_px)
-                        if up_px is not None:
-                            if up_px >= 0.99:
-                                pm_up_won = True
-                            elif up_px <= 0.01:
-                                pm_up_won = False
-                    except Exception as e:
-                        logger.warning("PM final resolution error: %s", e)
-            if pf_up_won is None and pm_up_won is not None:
+        # Both legs track the SAME BTC 5m event. True venue disagreement is
+        # extremely rare; almost always Gamma lag / wrong intermediate prices.
+        # NEVER settle opposite outcomes early — that zeros both legs of a hedge.
+
+        # Divergence: wait extra before forcing agreement (Gamma often flips late)
+        if (
+            pf_up_won is not None
+            and pm_up_won is not None
+            and pf_up_won != pm_up_won
+            and wait_s < 180
+        ):
+            last_log = float(getattr(hedge, "_last_res_log", 0) or 0)
+            if now - last_log >= 5.0:
+                hedge._last_res_log = now
+                logger.warning(
+                    "Hedge %s VENUE DIVERGENCE pf_up=%s pm_up=%s — waiting agreement "
+                    "(t+%.0fs/180s) slug=%s",
+                    hedge.id, pf_up_won, pm_up_won, wait_s,
+                    getattr(hedge, "pm_slug", "") or "?",
+                )
+            return
+
+        # Timeout / still missing / still diverge → single source of truth
+        if pf_up_won is None or pm_up_won is None or pf_up_won != pm_up_won:
+            slug = str(getattr(hedge, "pm_slug", "") or "")
+            if pm_up_won is None and slug:
+                try:
+                    up_px = await self.pm.resolved_leg_price(slug, "up")
+                    logger.info("PM final resolution slug=%s up_px=%s", slug, up_px)
+                    if up_px is not None:
+                        if up_px >= 0.95:
+                            pm_up_won = True
+                        elif up_px <= 0.05:
+                            pm_up_won = False
+                except Exception as e:
+                    logger.warning("PM final resolution error: %s", e)
+
+            # Prefer PF (usually faster/official for our account), else PM, else Up
+            if pf_up_won is not None and pm_up_won is not None and pf_up_won != pm_up_won:
+                logger.warning(
+                    "Hedge %s forcing agreement after wait: using PF pf_up=%s "
+                    "(ignored PM pm_up=%s) — same BTC event cannot diverge for hedge PnL",
+                    hedge.id, pf_up_won, pm_up_won,
+                )
+                pm_up_won = pf_up_won
+            elif pf_up_won is None and pm_up_won is not None:
                 pf_up_won = pm_up_won
             elif pm_up_won is None and pf_up_won is not None:
-                pm_up_won = pf_up_won  # assume same BTC outcome if PM Gamma lagging
-            elif pf_up_won is None and pm_up_won is None:
+                pm_up_won = pf_up_won
+            else:
                 pf_up_won = True
                 pm_up_won = True
             logger.warning(
-                "Hedge %s resolution timeout — fallback pf_up=%s pm_up=%s (slug=%s)",
-                hedge.id, pf_up_won, pm_up_won, getattr(hedge, "pm_slug", ""),
-            )
-
-        if pf_up_won != pm_up_won:
-            logger.warning(
-                "Hedge %s VENUE DIVERGENCE pf_up=%s pm_up=%s — settling each leg on its own venue",
-                hedge.id, pf_up_won, pm_up_won,
+                "Hedge %s resolution resolved pf_up=%s pm_up=%s (slug=%s t+%.0fs)",
+                hedge.id, pf_up_won, pm_up_won, slug, wait_s,
             )
 
         # Final entry reconcile from positions (avg + shares) before PnL

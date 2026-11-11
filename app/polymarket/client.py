@@ -225,6 +225,19 @@ class PolymarketClient:
 
     async def resolved_leg_price(self, slug: str, direction: str) -> Optional[float]:
         event = await self.event_by_slug(slug)
+        if event:
+            try:
+                mkts = event.get("markets") or []
+                m0 = mkts[0] if mkts else event
+                logger.info(
+                    "PM gamma slug=%s closed=%s outcomes=%s prices=%s",
+                    slug,
+                    event.get("closed") or (m0 or {}).get("closed"),
+                    (m0 or {}).get("outcomes"),
+                    (m0 or {}).get("outcomePrices"),
+                )
+            except Exception:
+                pass
         res = resolved_updown(event) if event else None
         if res is None:
             # Fallback: /markets?slug= (sometimes more up-to-date than /events)
