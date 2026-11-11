@@ -712,14 +712,19 @@ class HedgeEngine:
             leg.filled_shares = fill.shares
             leg.shares = fill.shares
             leg.entry_price = fill.price
-            # Prefer explicit USD from venue (PM makingAmount); else shares×price
+            # Prefer explicit USD from venue (PM makingAmount + optional taker fee)
             if fill.usd and fill.usd > 0:
                 leg.entry_usd = float(fill.usd)
             elif fill.shares > 0 and fill.price > 0:
                 leg.entry_usd = round(fill.shares * fill.price, 4)
-            # Re-derive avg if usd known (more accurate than limit)
-            if leg.entry_usd > 0 and leg.filled_shares > 0:
-                leg.entry_price = round(leg.entry_usd / leg.filled_shares, 4)
+            # Keep market avg price; do NOT fold fee into entry_price (fee lives in entry_usd only)
+            if leg.venue in ("pm", "polymarket") and leg.entry_usd and fill.price and fill.shares:
+                pre_fee = float(fill.price) * float(fill.shares)
+                if leg.entry_usd > pre_fee * 1.005:
+                    logger.info(
+                        "PM fill cost $%.4f includes ~$%.4f fee (pre-fee $%.4f @ %.4f)",
+                        leg.entry_usd, leg.entry_usd - pre_fee, pre_fee, fill.price,
+                    )
         elif fill.status == "REJECTED":
             leg.status = "REJECTED"
         elif fill.status == "SUBMITTED":

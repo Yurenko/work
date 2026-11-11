@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     private_key: str = ""
     funder_address: str = ""
     signature_type: int = 0
+    # Polymarket taker fee on top of CLOB makingAmount (wallet debit > making).
+    # Empirically ~4% (e.g. $2.46 → $2.56). Set 0 to disable.
+    pm_taker_fee_rate: float = 0.04
 
     # Server
     host: str = "0.0.0.0"

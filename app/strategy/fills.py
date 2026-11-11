@@ -99,8 +99,15 @@ def fill_from_pm_order(resp: Any, requested: float = 0.0, side: str = "BUY") -> 
             price = taking / making if making else 0.0
         else:
             shares = taking
-            usd = making
-            price = making / taking if taking else 0.0
+            # CLOB makingAmount is pre-fee; wallet usually pays more (taker fee).
+            try:
+                from app.core.config import get_settings
+                fee_rate = float(getattr(get_settings(), "pm_taker_fee_rate", 0.0) or 0.0)
+            except Exception:
+                fee_rate = 0.04
+            fee_rate = max(0.0, min(0.15, fee_rate))
+            usd = making * (1.0 + fee_rate)
+            price = making / taking if taking else 0.0  # mid/fill price stays pre-fee
         # Safety: outcome prices live in (0, 1.5]; if inverted, swap interpretation
         if price > 1.5 and side_u == "BUY":
             # probably was a sell-shaped response
