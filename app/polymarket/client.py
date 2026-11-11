@@ -453,9 +453,12 @@ class PolymarketClient:
         try:
             args = OrderArgs(token_id=token_id, price=px, size=sz, side=order_side)
             signed = client.create_order(args)
-            # FOK only — never leave resting GTC that can fill later + duplicate size.
-            # On FOK kill (no liquidity) return REJECTED; engine retries with a *new* signed order at worse price.
-            order_type = getattr(OrderType, "FOK", None) or getattr(OrderType, "FAK", None) or OrderType.GTC
+            # BUY: FAK = share-sized fill-and-kill (caps shares, no dollar-market overfill).
+            # SELL: FOK preferred for full exit; fall back FAK.
+            if side == "BUY":
+                order_type = getattr(OrderType, "FAK", None) or getattr(OrderType, "FOK", None) or OrderType.GTC
+            else:
+                order_type = getattr(OrderType, "FOK", None) or getattr(OrderType, "FAK", None) or OrderType.GTC
             try:
                 resp = client.post_order(signed, order_type)
             except Exception as e1:
