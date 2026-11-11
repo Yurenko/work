@@ -623,6 +623,15 @@ class HedgeEngine:
         logger.info("PM BUY match PF net=%.4f @ ask=%.4f (equal shares)", filled, pm_ask)
         pm_resp = await self.pm.place_market_buy(str(pm_token), filled, float(pm_ask))
         pm_fill = fill_from_pm_order(pm_resp, filled)
+        if (
+            pm_fill.status == "FILLED"
+            and filled > 0
+            and pm_fill.shares > filled * 1.05
+        ):
+            logger.warning(
+                "PM over-fill ordered=%.4f got=%.4f usd=%.4f — CLOB spent full maker at better price",
+                filled, pm_fill.shares, pm_fill.usd or 0,
+            )
         self._apply_fill(hedge.pm_leg, pm_fill)
 
         # If PM only resting (LIVE/SUBMITTED), cancel immediately — never leave open size

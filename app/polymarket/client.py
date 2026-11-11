@@ -49,10 +49,8 @@ def _quantize_buy_size(size: float, limit: float) -> float:
     limit_cents = int(round(float(limit) * 100))
     if limit_cents <= 0:
         return 0.0
-    # size in 1e-4 units
     units = int(math.floor(float(size) * 10000 + 1e-9))
     while units > 0:
-        # product_cents = units * limit_cents / 10000 must be integer
         if (units * limit_cents) % 10000 == 0:
             return units / 10000.0
         units -= 1
@@ -60,13 +58,15 @@ def _quantize_buy_size(size: float, limit: float) -> float:
 
 
 def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float]:
-    """Equal-share BUY size for Polymarket CLOB.
+    """Equal-share BUY for Polymarket CLOB.
 
-    Primary rule: size ≈ target_shares (match Predict.fun).
-    Only if target_shares * ask < $1.05 (CLOB min), bump size so cost at ask
-    is ~$1.20 and never more than $1.50.
-    Always quantize so size*limit is exact cents (maker 2dp) — otherwise
-    CLOB returns 400 invalid amounts.
+    Goal: filled shares ≈ PF shares.
+    - size starts at target_shares
+    - limit is TIGHT to ask (ceil to 2dp, +1¢ only if needed to cross)
+      so maker USDC ≈ size*ask. A wide limit (e.g. ask+4¢) lets the book
+      fill more shares for the same maker budget when price improves.
+    - min-notional bump only if size*ask < $1.05, and only up to ~$1.20–$1.50
+    - size quantized so size*limit is exact cents
     """
     MIN_USD = 1.05
     BUMP_USD = 1.20
@@ -74,30 +74,42 @@ def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float
     if ask is None or ask <= 0 or target_shares is None or target_shares <= 0:
         return 0.0, 0.0
     ask = float(ask)
-    limit = min(0.99, _ceil_dec(ask + 0.01, 2))
-    if limit < 0.01:
-        limit = 0.01
+    target = float(target_shares)
 
-    size = float(target_shares)
+    # Tight limit = ceil(ask, 2). NO extra +1¢ — a higher limit inflates maker USDC
+    # and CLOB may fill MORE shares when the real trade price is below limit
+    # (maker $1.80 / fill 0.26 = 6.92 sh instead of 6.05).
+    limit = _ceil_dec(ask, 2)
+    if limit < ask - 1e-12:
+        limit = _ceil_dec(ask + 1e-9, 2)
+    limit = min(0.99, max(0.01, limit))
+
+    size = target
     cost_at_ask = size * ask
+    bumped = False
     if cost_at_ask < MIN_USD:
+        bumped = True
         size = BUMP_USD / ask
-        if size * limit > MAX_BUMP_USD:
-            size = MAX_BUMP_USD / limit
         if size * ask > MAX_BUMP_USD:
             size = MAX_BUMP_USD / ask
+        if size * limit > MAX_BUMP_USD:
+            size = MAX_BUMP_USD / limit
 
     size = _quantize_buy_size(size, limit)
     if size <= 0:
-        # fallback: try from min notional upward
         for cents in range(int(math.ceil(MIN_USD * 100)), int(MAX_BUMP_USD * 100) + 1):
             raw = (cents / 100.0) / limit
             q = _quantize_buy_size(raw, limit)
             if q > 0 and q * limit + 1e-9 >= MIN_USD:
                 size = q
+                bumped = True
                 break
     if size <= 0:
         return 0.0, 0.0
+
+    # Hard guard: never exceed target by >2% unless min-notional bump
+    if not bumped and size > target * 1.02:
+        size = _quantize_buy_size(target, limit)
     return limit, size
 
 
