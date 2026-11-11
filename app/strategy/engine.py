@@ -1313,11 +1313,17 @@ class HedgeEngine:
         wait_s = now - float(hedge.market_end or now)
         pf_up_won: bool | None = None
         pm_up_won: bool | None = None
+        # Never settle in the first 45s — Gamma/UI often still "determining winner"
+        MIN_WAIT_S = 45.0
 
         # --- Predict.fun resolution ---
         try:
             mid = str(getattr(hedge, "pf_market_id", "") or hedge.pf_leg.token_or_market)
             pf_up_won = await self.pf.market_up_won(mid)
+            logger.info(
+                "PF settle check hedge=%s market=%s → pf_up_won=%s",
+                hedge.id, mid, pf_up_won,
+            )
         except Exception as e:
             logger.warning("PF resolution lookup failed: %s", e)
 
@@ -1329,35 +1335,25 @@ class HedgeEngine:
                 slug = str(self.pm_market.get("slug") or "")
             if slug:
                 up_px = await self.pm.resolved_leg_price(slug, "up")
+                # resolved_leg_price only returns a value when Gamma prices are
+                # extreme (0/1). Mid-market quotes return None → keep waiting.
                 if up_px is not None:
-                    logger.info(
-                        "PM resolution slug=%s up_px=%.4f (hedge=%s)",
-                        slug, up_px, hedge.id,
-                    )
-                    if up_px >= 0.95:
+                    if up_px >= 0.99:
                         pm_up_won = True
-                    elif up_px <= 0.05:
+                    elif up_px <= 0.01:
                         pm_up_won = False
                     else:
-                        # still calculating (0.5 etc.)
-                        pm_up_won = None
-                if pm_up_won is None:
-                    # try down leg as well
-                    dn_px = await self.pm.resolved_leg_price(slug, "down")
-                    if dn_px is not None:
-                        logger.info(
-                            "PM resolution slug=%s dn_px=%.4f (hedge=%s)",
-                            slug, dn_px, hedge.id,
-                        )
-                        if dn_px >= 0.95:
-                            pm_up_won = False
-                        elif dn_px <= 0.05:
-                            pm_up_won = True
+                        pm_up_won = None  # should not happen with strict parser
+                logger.info(
+                    "PM settle check hedge=%s slug=%s up_px=%s → pm_up_won=%s",
+                    hedge.id, slug, up_px, pm_up_won,
+                )
         except Exception as e:
             logger.warning("PM resolution lookup failed: %s", e)
 
-        # Not ready yet — wait up to 4 min (Gamma often lags 30–180s)
-        if (pf_up_won is None or pm_up_won is None) and wait_s < 240:
+        # Not ready yet — wait up to 4 min (Gamma often lags 30–180s).
+        # Also enforce MIN_WAIT even when both venues already report.
+        if (pf_up_won is None or pm_up_won is None or wait_s < MIN_WAIT_S) and wait_s < 240:
             # Throttle logs + gamma hammering to every 5s
             last_log = float(getattr(hedge, "_last_res_log", 0) or 0)
             if now - last_log >= 5.0:
@@ -1408,23 +1404,36 @@ class HedgeEngine:
                 except Exception as e:
                     logger.warning("PM final resolution error: %s", e)
 
-            # Prefer PF (usually faster/official for our account), else PM, else Up
-            if pf_up_won is not None and pm_up_won is not None and pf_up_won != pm_up_won:
-                logger.warning(
-                    "Hedge %s forcing agreement after wait: using PF pf_up=%s "
-                    "(ignored PM pm_up=%s) — same BTC event cannot diverge for hedge PnL",
-                    hedge.id, pf_up_won, pm_up_won,
-                )
-                pm_up_won = pf_up_won
-            elif pf_up_won is None and pm_up_won is not None:
+            # After long wait: fill missing side from the known one; if both known
+            # and still diverge, KEEP independent outcomes (true venue split exists).
+            if pf_up_won is None and pm_up_won is not None:
                 pf_up_won = pm_up_won
+                logger.warning(
+                    "Hedge %s PF unknown after wait — using PM pm_up=%s for both",
+                    hedge.id, pm_up_won,
+                )
             elif pm_up_won is None and pf_up_won is not None:
                 pm_up_won = pf_up_won
-            else:
+                logger.warning(
+                    "Hedge %s PM unknown after wait — using PF pf_up=%s for both",
+                    hedge.id, pf_up_won,
+                )
+            elif pf_up_won is None and pm_up_won is None:
+                # last resort: no data at all
                 pf_up_won = True
                 pm_up_won = True
-            logger.warning(
-                "Hedge %s resolution resolved pf_up=%s pm_up=%s (slug=%s t+%.0fs)",
+                logger.warning(
+                    "Hedge %s NO resolution data after wait — fallback Up/Up",
+                    hedge.id,
+                )
+            elif pf_up_won != pm_up_won:
+                logger.warning(
+                    "Hedge %s TRUE DIVERGENCE after wait pf_up=%s pm_up=%s — "
+                    "settling each leg on its own venue outcome",
+                    hedge.id, pf_up_won, pm_up_won,
+                )
+            logger.info(
+                "Hedge %s resolution final pf_up=%s pm_up=%s (slug=%s t+%.0fs)",
                 hedge.id, pf_up_won, pm_up_won, slug, wait_s,
             )
 

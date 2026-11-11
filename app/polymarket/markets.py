@@ -35,11 +35,15 @@ def _loads(raw: Any) -> list:
 
 
 def resolved_updown(event: dict) -> Optional[dict[str, float]]:
-    """Return {up: 0|1, down: 0|1} when market is fully resolved, else None."""
+    """Return {up: 0|1, down: 0|1} only when market is *fully* resolved.
+
+    Mid prices like 0.62/0.38 must return None — never treat as final outcome.
+    Requires BOTH legs at extremes (≈0 and ≈1) summing to ~1. Prefer closed/
+    automaticallyResolved, but allow extreme 0/1 even if closed flag lags.
+    """
     if not event:
         return None
     markets = event.get("markets") or []
-    # Sometimes gamma returns the market object itself
     if not markets and (event.get("outcomePrices") or event.get("outcomes")):
         markets = [event]
     if not markets:
@@ -53,40 +57,42 @@ def resolved_updown(event: dict) -> Optional[dict[str, float]]:
     ).lower()
     closed = market.get("closed") is True or str(market.get("closed") or "").lower() == "true"
     closed = closed or event.get("closed") is True or str(event.get("closed") or "").lower() == "true"
-    # Also treat automaticallyResolved + prices at extremes as resolved
     auto = market.get("automaticallyResolved") is True
     outcomes = [str(x).lower() for x in _loads(market.get("outcomes") or event.get("outcomes"))]
     raw_prices = _loads(market.get("outcomePrices") or event.get("outcomePrices"))
     if len(outcomes) < 2 or len(raw_prices) < 2:
         return None
-    # Parse prices first — if already 0/1 we can trust even before closed flag flips
+
     out: dict[str, float] = {}
-    ambiguous = False
     for name, raw in zip(outcomes, raw_prices):
         try:
             price = float(raw)
         except (TypeError, ValueError):
             return None
-        if price >= 0.95:
+        # STRICT: only near 0 or near 1 counts as resolved
+        if price >= 0.99:
             price = 1.0
-        elif price <= 0.05:
+        elif price <= 0.01:
             price = 0.0
         else:
-            ambiguous = True
-            continue
+            # still trading / determining winner — not resolved
+            return None
         if name in ("up", "yes"):
             out["up"] = price
         elif name in ("down", "no"):
             out["down"] = price
-    if ambiguous or "up" not in out or "down" not in out:
+
+    if "up" not in out or "down" not in out:
         return None
-    if abs(out["up"] + out["down"] - 1.0) > 0.05:
+    # Must be opposite extremes
+    if out["up"] == out["down"]:
         return None
-    # Require closed/resolved OR both legs extreme (0 and 1)
-    if not (closed or status in {"resolved", "settled"} or auto):
-        # prices already extreme — accept (gamma lag on closed flag)
-        if not (out["up"] in (0.0, 1.0) and out["down"] in (0.0, 1.0)):
-            return None
+    if abs(out["up"] + out["down"] - 1.0) > 0.02:
+        return None
+    # Prefer official closed/resolved flag; still accept pure 0/1 (gamma lag)
+    if not (closed or auto or status in {"resolved", "settled"}):
+        # prices are extreme — OK, but caller should still wait min time
+        pass
     return out
 
 

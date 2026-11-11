@@ -248,12 +248,22 @@ class PolymarketClient:
                     data = r.json()
                     mkt = data[0] if isinstance(data, list) and data else data
                     if isinstance(mkt, dict):
+                        logger.info(
+                            "PM gamma /markets slug=%s closed=%s outcomes=%s prices=%s",
+                            slug, mkt.get("closed"), mkt.get("outcomes"), mkt.get("outcomePrices"),
+                        )
                         res = resolved_updown({"markets": [mkt], "closed": mkt.get("closed")})
             except Exception as e:
                 logger.debug("PM markets slug fallback: %s", e)
         if not res:
+            logger.info("PM resolution slug=%s not final yet (mid prices or open)", slug)
             return None
-        return res.get(direction.lower())
+        val = res.get(direction.lower())
+        logger.info(
+            "PM resolution FINAL slug=%s %s=%.4f full=%s",
+            slug, direction.lower(), float(val) if val is not None else -1, res,
+        )
+        return val
 
     async def rest_book(self, token_id: str) -> dict:
         http = await self._ensure_http()
