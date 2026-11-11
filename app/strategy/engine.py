@@ -569,6 +569,18 @@ class HedgeEngine:
                 if real_px <= 0:
                     real_px = float(pf_fill.price or lim or 0)
                     src = "limit_fallback"
+                fill_sh = float(pf_fill.shares or 0)
+                # CRITICAL: positions API returns TOTAL shares for the market (may include
+                # leftover dust / prior hedges). Never size THIS hedge above the fill.
+                if fill_sh > 0 and real_sh > fill_sh * 1.05:
+                    logger.warning(
+                        "PF reconcile cap shares %.4f → %.4f (position total > this fill)",
+                        real_sh, fill_sh,
+                    )
+                    if real_px > 0:
+                        real_usd = fill_sh * real_px
+                    real_sh = fill_sh
+                    src = src + "+capped"
                 if real_usd <= 0 and real_sh > 0 and real_px > 0:
                     real_usd = real_sh * real_px
                 if real_sh > 0 and real_px > 0:
@@ -645,8 +657,10 @@ class HedgeEngine:
                 await self.pm.cancel_order(pm_fill.order_id)
             except Exception:
                 pass
-            # Retry once with same equal-share size (FOK may miss once)
-            pm_resp2 = await self.pm.place_market_buy(str(pm_token), filled, float(pm_ask))
+            # Retry once: same shares, ask+2¢ so FOK can take more book depth
+            retry_ask = min(0.99, float(pm_ask) + 0.02)
+            logger.info("PM BUY FOK retry shares=%.4f ask=%.4f→%.4f", filled, pm_ask, retry_ask)
+            pm_resp2 = await self.pm.place_market_buy(str(pm_token), filled, retry_ask)
             pm_fill = fill_from_pm_order(pm_resp2, filled)
             self._apply_fill(hedge.pm_leg, pm_fill)
             if pm_fill.status == "SUBMITTED" and pm_fill.order_id:
@@ -830,21 +844,45 @@ class HedgeEngine:
                 ap = float(pos.get("avg_price") or 0)
                 if cu <= 0 and ap > 0:
                     cu = sh * ap
-                if cu > 0 and sh > 0:
+                old_sh = float(hedge.pf_leg.filled_shares or 0)
+                # Only update PRICE from venue avg; never expand size past this hedge's fill.
+                # Position total can include other fills on the same market.
+                if old_sh > 0 and sh > old_sh * 1.08 and hedge.status in ("OPEN", "PARTIAL", "CLOSING"):
+                    logger.info(
+                        "PF re-reconcile [%s] ignore position size %.4f > tracked %.4f (use avg only)",
+                        reason, sh, old_sh,
+                    )
+                    if 0.01 <= (ap or (cu / sh if sh else 0)) <= 1.0:
+                        new_px = ap if 0.01 <= ap <= 1.0 else (cu / sh)
+                        old_px = float(hedge.pf_leg.entry_price or 0)
+                        if abs(old_px - new_px) > 0.01:
+                            hedge.pf_leg.entry_price = round(new_px, 4)
+                            hedge.pf_leg.entry_usd = round(old_sh * new_px, 4)
+                            changed = True
+                            logger.info(
+                                "PF re-reconcile [%s] avg only %.4f→%.4f (shares stay %.4f)",
+                                reason, old_px, new_px, old_sh,
+                            )
+                elif cu > 0 and sh > 0:
                     new_px = cu / sh
                     if 0.01 <= new_px <= 1.0:
                         old_px = float(hedge.pf_leg.entry_price or 0)
-                        old_sh = float(hedge.pf_leg.filled_shares or 0)
-                        hedge.pf_leg.filled_shares = sh
-                        hedge.pf_leg.shares = sh
-                        hedge.pf_leg.entry_usd = cu
-                        hedge.pf_leg.entry_price = round(new_px, 4)
-                        if abs(old_px - new_px) > 0.005 or abs(old_sh - sh) > 0.05:
-                            changed = True
-                            logger.info(
-                                "PF re-reconcile [%s] shares=%.4f→%.4f avg=%.4f→%.4f usd=%.4f",
-                                reason, old_sh, sh, old_px, new_px, cu,
-                            )
+                        # Allow shrink (sold partially) or tiny growth
+                        if old_sh <= 0 or sh <= old_sh * 1.08:
+                            hedge.pf_leg.filled_shares = sh
+                            hedge.pf_leg.shares = sh
+                            hedge.pf_leg.entry_usd = cu if sh <= old_sh * 1.08 else round(old_sh * new_px, 4)
+                            if sh > old_sh * 1.08:
+                                hedge.pf_leg.filled_shares = old_sh
+                                hedge.pf_leg.shares = old_sh
+                            hedge.pf_leg.entry_price = round(new_px, 4)
+                            if abs(old_px - new_px) > 0.005 or abs(old_sh - hedge.pf_leg.filled_shares) > 0.05:
+                                changed = True
+                                logger.info(
+                                    "PF re-reconcile [%s] shares=%.4f→%.4f avg=%.4f→%.4f usd=%.4f",
+                                    reason, old_sh, hedge.pf_leg.filled_shares, old_px, new_px,
+                                    hedge.pf_leg.entry_usd,
+                                )
             # Activity fallback if still looks like limit
             if hedge.pf_leg.entry_price and hedge.pf_leg.entry_price > 0:
                 act = await self.pf.get_fill_price_from_activity(
@@ -856,20 +894,25 @@ class HedgeEngine:
                     ash = float(act.get("shares") or 0) or float(hedge.pf_leg.filled_shares or 0)
                     if cu > 0 and ash > 0:
                         new_px = cu / ash
+                        tracked = float(hedge.pf_leg.filled_shares or 0)
                         if 0.01 <= new_px <= 1.0 and (
                             hedge.pf_leg.entry_price <= 0
                             or new_px < float(hedge.pf_leg.entry_price) * 0.98
                             or abs(new_px - float(hedge.pf_leg.entry_price or 0)) > 0.02
                         ):
                             old_px = float(hedge.pf_leg.entry_price or 0)
-                            hedge.pf_leg.filled_shares = ash
-                            hedge.pf_leg.shares = ash
-                            hedge.pf_leg.entry_usd = cu
+                            # Activity for this order: use ash only if close to tracked
+                            if tracked <= 0 or ash <= tracked * 1.08:
+                                hedge.pf_leg.filled_shares = ash
+                                hedge.pf_leg.shares = ash
+                                hedge.pf_leg.entry_usd = cu
+                            else:
+                                hedge.pf_leg.entry_usd = round(tracked * new_px, 4)
                             hedge.pf_leg.entry_price = round(new_px, 4)
                             changed = True
                             logger.info(
-                                "PF activity re-reconcile [%s] avg=%.4f→%.4f usd=%.4f",
-                                reason, old_px, new_px, cu,
+                                "PF activity re-reconcile [%s] avg=%.4f→%.4f usd=%.4f sh=%.4f",
+                                reason, old_px, new_px, hedge.pf_leg.entry_usd, hedge.pf_leg.filled_shares,
                             )
         except Exception as e:
             logger.warning("PF re-reconcile [%s]: %s", reason, e)
@@ -950,8 +993,8 @@ class HedgeEngine:
             except Exception as e:
                 logger.debug("%s position lookup for sell: %s", label, e)
 
-            # Floor to 4dp and haircut 1% — chain balance often lags fill by a few seconds
-            size = max(0.0, int(size * 0.99 * 10000) / 10000.0)
+            # Floor to 4dp and haircut 3% — PF balance lags + fee dust often rejects 99%
+            size = max(0.0, int(size * 0.97 * 10000) / 10000.0)
 
             # Dust below min notional (~$1 at typical prices) — cannot sell, mark closed
             bid, _ = self._pf_best(leg.token_or_market, leg.direction)
@@ -1013,13 +1056,31 @@ class HedgeEngine:
                 leg.reject_reason = fill.reason or ""
                 logger.warning("%s sell rejected: %s", label, fill.reason)
                 if "insufficient" in reason and "share" in reason:
-                    # Shrink tracked size slightly for next retry; do NOT mark CLOSED
-                    # while position may still exist (fee/rounding lag)
-                    leg.filled_shares = max(0.0, float(leg.filled_shares or 0) * 0.98)
-                    logger.info(
-                        "%s sell: insufficient — shrink tracked to %.4f, will retry",
-                        label, leg.filled_shares,
-                    )
+                    # Re-read live balance — concurrent sell may have already filled
+                    try:
+                        is_yes = leg.direction == "up"
+                        pos = await self.pf.get_position_for_market(leg.token_or_market, is_yes=is_yes)
+                        live = float((pos or {}).get("shares") or 0)
+                    except Exception:
+                        live = 0.0
+                    if live <= 0.05:
+                        # Position gone → treat sell as done (order likely filled despite error)
+                        leg.status = "CLOSED"
+                        if not leg.exit_price:
+                            bid, _ = self._pf_best(leg.token_or_market, leg.direction)
+                            leg.exit_price = float(bid or leg.entry_price or 0)
+                            leg.exit_usd = float(leg.filled_shares or 0) * leg.exit_price
+                        logger.info(
+                            "%s sell: insufficient but live=0 — mark CLOSED (likely filled)",
+                            label,
+                        )
+                    else:
+                        # Shrink to 95% of live for next attempt
+                        leg.filled_shares = max(0.0, int(live * 0.95 * 10000) / 10000.0)
+                        logger.info(
+                            "%s sell: insufficient — live=%.4f shrink tracked to %.4f",
+                            label, live, leg.filled_shares,
+                        )
             return
 
         # Polymarket
@@ -1045,7 +1106,9 @@ class HedgeEngine:
     async def _finish_exit(self, hedge: Hedge, now: float) -> None:
         # Throttle sell attempts (avoid 1Hz spam when market closed)
         last = float(getattr(hedge, "last_exit_try_at", 0) or 0)
-        if now - last < 3.0:
+        # Back off as tries grow (3s → 8s) to avoid order spam
+        gap = 3.0 if int(getattr(hedge, "exit_tries", 0) or 0) < 3 else 8.0
+        if now - last < gap:
             return
         hedge.last_exit_try_at = now
         hedge.exit_tries = int(getattr(hedge, "exit_tries", 0) or 0) + 1
@@ -1066,8 +1129,19 @@ class HedgeEngine:
                 # keep CLOSING until market_end flips to SETTLING in _manage_open
                 return
         if hedge.exit_tries >= 8:
-            logger.warning("Hedge %s exit tries exhausted — hold to SETTLE", hedge.id)
-            return
+            # Log once every ~30s instead of every 3s
+            if hedge.exit_tries == 8 or hedge.exit_tries % 10 == 0:
+                logger.warning(
+                    "Hedge %s exit tries=%d — hold to SETTLE (PF=%s PM=%s)",
+                    hedge.id, hedge.exit_tries,
+                    hedge.pf_leg.status, hedge.pm_leg.status,
+                )
+            # If PF already closed/dust and PM still open, keep trying PM only less often
+            if hedge.pf_leg.status == "CLOSED" and hedge.pm_leg.status != "CLOSED":
+                if hedge.exit_tries % 3 != 0:
+                    return
+            else:
+                return
 
         if hedge.pf_leg.status == "CLOSED" and hedge.pm_leg.status == "CLOSED":
             def _leg_pnl_exit(leg: Leg) -> float:
