@@ -606,6 +606,12 @@ class HedgeEngine:
         if pm_fill.status == "FILLED" and pf_fill.status != "FILLED":
             await _asyncio.sleep(1.0)
             logger.info("PF limit retry after PM filled")
+            if pf_fill.order_id:
+                try:
+                    await self.pf.cancel_order(str(pf_fill.order_id))
+                    logger.info("PF cancel resting %s before retry", pf_fill.order_id)
+                except Exception as e:
+                    logger.warning("PF cancel before retry: %s", e)
             pf_resp2 = await self.pf.place_order(
                 pf_m["id"], "BUY", order_shares, min(0.99, pf_px + 0.02),
                 is_yes=(pf_dir == "up"),
@@ -745,6 +751,14 @@ class HedgeEngine:
                 await self._settle_pair(hedge, now)
 
     async def _retry_partial(self, hedge: Hedge, now: float) -> None:
+        """Complete a PARTIAL hedge: only fill the missing leg.
+
+        Critical rules:
+        - NEVER place a second PF buy without canceling the previous order.
+        - Prefer live position check over placing more orders (404 order status is common).
+        - If PF already has shares → mark FILLED, only retry PM.
+        - Max retries still apply.
+        """
         if hedge.retries >= self.settings.leg_retry_max:
             return
         if now - hedge.last_retry_at < self.settings.leg_retry_sec:
@@ -754,41 +768,107 @@ class HedgeEngine:
         hedge.last_retry_at = now
         hedge.retries += 1
 
+        # --- PF leg: detect fill from position; cancel resting; at most ONE new buy ---
         if hedge.pf_leg.status != "FILLED":
-            _, ask = self._pf_best(hedge.pf_leg.token_or_market, hedge.pf_leg.direction)
-            if ask:
-                resp = await self.pf.place_order(
-                    hedge.pf_leg.token_or_market,
-                    "BUY",
-                    hedge.pf_leg.requested_shares,
-                    ask,
-                    is_yes=(hedge.pf_leg.direction == "up"),
-                )
-                self._apply_fill(hedge.pf_leg, fill_from_predict(resp, hedge.pf_leg.requested_shares))
+            is_yes = hedge.pf_leg.direction == "up"
+            mid = hedge.pf_leg.token_or_market
+            need = float(hedge.pf_leg.requested_shares or 0)
+            # 1) Live position first (order GET often 404 after fill)
+            try:
+                try:
+                    pos = await self.pf.get_position_for_market(mid, is_yes=is_yes)
+                except TypeError:
+                    pos = await self.pf.get_position_for_market(mid)
+                if pos and float(pos.get("shares") or 0) >= max(0.5, need * 0.5):
+                    sh = float(pos["shares"])
+                    # Cap to this hedge's requested size (other fills may exist)
+                    sh = min(sh, need * 1.05) if need > 0 else sh
+                    ap = float(pos.get("avg_price") or 0)
+                    cu = float(pos.get("cost_usd") or 0) or (sh * ap if ap else 0)
+                    if cu > 0 and sh > 0 and (cu / sh) > 1.5 and cu > 50:
+                        cu = cu / 100.0
+                    px = (cu / sh) if (cu > 0 and sh > 0) else (ap or 0)
+                    if 0.01 <= px <= 1.0:
+                        self._apply_fill(
+                            hedge.pf_leg,
+                            Fill(status="FILLED", shares=round(sh, 4), price=round(px, 4),
+                                 usd=round(cu or sh * px, 4), order_id=hedge.pf_leg.order_id),
+                        )
+                        logger.info(
+                            "PF retry: position shows FILLED %.4f@%.4f (no new order)",
+                            sh, px,
+                        )
+            except Exception as e:
+                logger.debug("PF position check on retry: %s", e)
 
-        if hedge.pm_leg.status != "FILLED" and hedge.pf_leg.status == "FILLED":
-            if (hedge.pm_leg.filled_shares or 0) > 0:
-                logger.info("PM already has %.2f filled — skip retry buy", hedge.pm_leg.filled_shares)
-            _, ask = self._pm_best(hedge.pm_leg.direction)
-            size = hedge.pf_leg.filled_shares or hedge.pf_leg.requested_shares
-            if ask and size > 0 and (hedge.pm_leg.filled_shares or 0) <= 0:
-                # Cancel any previous resting PM order first
-                if hedge.pm_leg.order_id and hedge.pm_leg.status == "SUBMITTED":
+            # 2) Still not filled → cancel any resting order, then place ONE new buy
+            if hedge.pf_leg.status != "FILLED":
+                if hedge.pf_leg.order_id:
                     try:
-                        await self.pm.cancel_order(hedge.pm_leg.order_id)
-                        logger.info("PM cancel before retry %s", hedge.pm_leg.order_id[:18])
+                        await self.pf.cancel_order(str(hedge.pf_leg.order_id))
+                        logger.info("PF cancel before retry buy id=%s", hedge.pf_leg.order_id)
                     except Exception as e:
-                        logger.warning("PM cancel before retry: %s", e)
-                # Pass real ask — equal shares; min-notional bump inside polymarket_buy_order
-                resp = await self.pm.place_market_buy(hedge.pm_leg.token_or_market, size, float(ask))
-                fill = fill_from_pm_order(resp, size)
-                if fill.status == "SUBMITTED" and fill.order_id:
-                    try:
-                        await self.pm.cancel_order(fill.order_id)
-                    except Exception:
-                        pass
-                    fill = Fill(status="REJECTED", reason="PM resting on retry", order_id=fill.order_id)
-                self._apply_fill(hedge.pm_leg, fill)
+                        logger.warning("PF cancel before retry: %s", e)
+                    hedge.pf_leg.order_id = ""
+                    hedge.pf_leg.status = "REJECTED"  # cleared resting
+
+                _, ask = self._pf_best(mid, hedge.pf_leg.direction)
+                if ask and need > 0:
+                    # Only one replacement order; aggressive limit
+                    px = min(0.99, round(float(ask) + 0.02, 2))
+                    logger.info("PF retry BUY once size=%.4f @ %.2f (after cancel)", need, px)
+                    resp = await self.pf.place_order(
+                        mid, "BUY", need, px, is_yes=is_yes,
+                    )
+                    fill = fill_from_predict(resp, need)
+                    self._apply_fill(hedge.pf_leg, fill)
+                    # If SUBMITTED, wait briefly and check position — do NOT place another
+                    if fill.status == "SUBMITTED":
+                        import asyncio as _aio
+                        await _aio.sleep(1.5)
+                        try:
+                            try:
+                                pos = await self.pf.get_position_for_market(mid, is_yes=is_yes)
+                            except TypeError:
+                                pos = await self.pf.get_position_for_market(mid)
+                            if pos and float(pos.get("shares") or 0) >= max(0.5, need * 0.5):
+                                sh = min(float(pos["shares"]), need * 1.05)
+                                ap = float(pos.get("avg_price") or px)
+                                cu = float(pos.get("cost_usd") or 0) or sh * ap
+                                self._apply_fill(
+                                    hedge.pf_leg,
+                                    Fill(status="FILLED", shares=round(sh, 4),
+                                         price=round(ap if 0.01 <= ap <= 1 else px, 4),
+                                         usd=round(cu, 4), order_id=fill.order_id),
+                                )
+                        except Exception:
+                            pass
+
+        # --- PM leg: only if PF is filled and PM empty ---
+        if hedge.pm_leg.status != "FILLED" and hedge.pf_leg.status == "FILLED":
+            if (hedge.pm_leg.filled_shares or 0) > 0.5:
+                logger.info("PM already has %.2f filled — skip retry buy", hedge.pm_leg.filled_shares)
+            else:
+                _, ask = self._pm_best(hedge.pm_leg.direction)
+                size = float(hedge.pf_leg.filled_shares or hedge.pf_leg.requested_shares or 0)
+                if ask and size > 0:
+                    if hedge.pm_leg.order_id and hedge.pm_leg.status == "SUBMITTED":
+                        try:
+                            await self.pm.cancel_order(hedge.pm_leg.order_id)
+                            logger.info("PM cancel before retry %s", hedge.pm_leg.order_id[:18])
+                        except Exception as e:
+                            logger.warning("PM cancel before retry: %s", e)
+                    resp = await self.pm.place_market_buy(
+                        hedge.pm_leg.token_or_market, size, float(ask),
+                    )
+                    fill = fill_from_pm_order(resp, size)
+                    if fill.status == "SUBMITTED" and fill.order_id:
+                        try:
+                            await self.pm.cancel_order(fill.order_id)
+                        except Exception:
+                            pass
+                        fill = Fill(status="REJECTED", reason="PM resting on retry", order_id=fill.order_id)
+                    self._apply_fill(hedge.pm_leg, fill)
 
         if hedge.pf_leg.status == "FILLED" and hedge.pm_leg.status == "FILLED":
             hedge.status = "OPEN"

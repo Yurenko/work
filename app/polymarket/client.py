@@ -58,16 +58,15 @@ def _quantize_buy_size(size: float, limit: float) -> float:
 
 
 def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float]:
-    """Equal-share BUY for Polymarket CLOB.
+    """Share-sized BUY for Polymarket CLOB.
 
-    Filled shares should stay ≤ PF net shares (except min-notional bump).
-
-    Maker USDC is floored to target*ask so a FOK fill cheaper than `limit`
-    cannot deliver more shares than we ordered for.
+    Default: size ≈ target_shares (equal to PF), quantized for CLOB rules.
+    Only if notional < $1.05 (cheap ask), bump size so spend ≈ $1.20–$1.50.
+    Always quantize so maker USDC has ≤2 decimals (avoids 400 invalid amounts).
     """
-    MIN_CENTS = 105   # $1.05
-    BUMP_CENTS = 120  # $1.20
-    MAX_BUMP_CENTS = 150
+    MIN_NOTIONAL = 1.05
+    BUMP_USD = 1.20
+    MAX_BUMP_USD = 1.50
     if ask is None or ask <= 0 or target_shares is None or target_shares <= 0:
         return 0.0, 0.0
     ask = float(ask)
@@ -78,23 +77,34 @@ def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float
         limit = _ceil_dec(ask + 1e-9, 2)
     limit = min(0.99, max(0.01, limit))
 
-    maker_cents = int(math.floor(target * ask * 100 + 1e-9))
-    bumped = False
-    if maker_cents < MIN_CENTS:
-        bumped = True
-        maker_cents = min(MAX_BUMP_CENTS, max(BUMP_CENTS, MIN_CENTS))
+    # 1) Prefer exact target shares
+    size = _quantize_buy_size(target, limit)
+    if size <= 0:
+        size = _floor_dec(target, 4)
+        size = _quantize_buy_size(size, limit)
 
-    # size from budget at limit price, 4dp floor
-    size = math.floor(maker_cents / 100.0 / limit * 10000 + 1e-9) / 10000.0
-    while size > 0 and int(round(size * limit * 100)) > maker_cents:
-        size = math.floor(size * 10000 - 1) / 10000.0
-    if not bumped and size > target:
-        size = math.floor(target * 10000 + 1e-9) / 10000.0
-        while size > 0 and int(round(size * limit * 100)) > maker_cents:
-            size = math.floor(size * 10000 - 1) / 10000.0
+    notional = size * limit if size > 0 else 0.0
+    # 2) Min-notional bump only when cheap (cannot spend $1 with target shares)
+    if notional < MIN_NOTIONAL and limit > 0:
+        need = min(MAX_BUMP_USD, max(BUMP_USD, MIN_NOTIONAL))
+        raw = need / limit
+        # never more than ~target * (need / (target*ask)) roughly; hard cap 2x target or 15 shares
+        raw = min(raw, max(target * 2.5, 15.0))
+        size = _quantize_buy_size(raw, limit)
+        # walk up if still under min after quantize
+        if size * limit < MIN_NOTIONAL:
+            units = int(math.floor(size * 10000 + 1e-9)) + 1
+            while units < 200000:  # safety
+                cand = units / 10000.0
+                if (units * int(round(limit * 100))) % 10000 == 0 and cand * limit >= MIN_NOTIONAL:
+                    size = cand
+                    break
+                units += 1
 
     if size <= 0:
         return 0.0, 0.0
+    # final safety quantize
+    size = _quantize_buy_size(size, limit) or size
     return limit, size
 
 
@@ -445,6 +455,7 @@ class PolymarketClient:
             )
             order_side = BUY
             px, sz = limit, size
+            sz = _quantize_buy_size(sz, px) or sz  # final CLOB decimal safety
         else:
             order_side = SELL
             px = _floor_dec(price, 2) if price else 0.01
@@ -455,17 +466,32 @@ class PolymarketClient:
             signed = client.create_order(args)
             # BUY: FAK = share-sized fill-and-kill (caps shares, no dollar-market overfill).
             # SELL: FOK preferred for full exit; fall back FAK.
-            if side == "BUY":
-                order_type = getattr(OrderType, "FAK", None) or getattr(OrderType, "FOK", None) or OrderType.GTC
-            else:
-                order_type = getattr(OrderType, "FOK", None) or getattr(OrderType, "FAK", None) or OrderType.GTC
+            # Both legs: FAK — fill what's available (FOK kills entire exit on thin book)
+            order_type = getattr(OrderType, "FAK", None) or getattr(OrderType, "FOK", None) or OrderType.GTC
             try:
                 resp = client.post_order(signed, order_type)
             except Exception as e1:
                 msg = str(e1)
                 logger.warning("PM post_order %s failed (%s)", order_type, msg)
-                # Do not re-post the same signature (→ "Duplicated")
-                return {"status": "REJECTED", "reason": msg, "avgPrice": px}
+                # FAK with no book match: one aggressive retry at limit+2¢ (new signature)
+                if (
+                    side == "BUY"
+                    and ("no orders found" in msg.lower() or "fak" in msg.lower())
+                    and px < 0.97
+                ):
+                    try:
+                        px2 = min(0.99, round(float(px) + 0.02, 2))
+                        sz2 = _quantize_buy_size(float(sz), px2) or float(sz)
+                        logger.info("PM FAK no-match retry size=%.4f limit=%.2f→%.2f", sz2, px, px2)
+                        args2 = OrderArgs(token_id=token_id, price=px2, size=sz2, side=BUY)
+                        signed2 = client.create_order(args2)
+                        resp = client.post_order(signed2, order_type)
+                        px, sz = px2, sz2
+                    except Exception as e2:
+                        logger.warning("PM FAK retry failed (%s)", e2)
+                        return {"status": "REJECTED", "reason": msg, "avgPrice": px}
+                else:
+                    return {"status": "REJECTED", "reason": msg, "avgPrice": px}
             logger.info("PM LIVE %s type=%s resp=%s", side, order_type, resp)
             if not resp or (isinstance(resp, dict) and (resp.get("error") or (resp.get("success") is False and resp.get("status") != "matched"))):
                 reason = ""
@@ -484,6 +510,16 @@ class PolymarketClient:
                 if status in ("MATCHED", "FILLED"):
                     status = "FILLED"
                     if filled <= 0:
+                        filled = sz
+                    # Cap reported shares to ordered size (CLOB can slightly over-deliver)
+                    if side == "BUY" and sz > 0 and filled > sz * 1.001:
+                        logger.warning(
+                            "PM fill shares %.4f > ordered %.4f — capping report to ordered",
+                            filled, sz,
+                        )
+                        # keep real avg from making/taking, but hedge size = ordered
+                        if making and making > 0 and taking and taking > 0:
+                            avg = making / taking  # real VWAP
                         filled = sz
                 elif status == "LIVE":
                     status = "SUBMITTED"
