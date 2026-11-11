@@ -616,10 +616,9 @@ class HedgeEngine:
         if hedge.pm_leg.order_id and hedge.pm_leg.status in ("FILLED", "SUBMITTED"):
             logger.warning("PM leg already has order %s — skip second place", hedge.pm_leg.order_id[:18])
             return
-        # 2) Polymarket FOK for the same share count (aggressive +2¢)
-        pm_px = min(0.99, round(float(pm_ask) + 0.02, 2))
-        logger.info("PM BUY match PF net=%.4f @ limit %.2f (ask=%.2f)", filled, pm_px, pm_ask)
-        pm_resp = await self.pm.place_market_buy(str(pm_token), filled, pm_px)
+        # 2) Polymarket FOK — same share count as PF (min-notional bump only if < $1)
+        logger.info("PM BUY match PF net=%.4f @ ask=%.4f (equal shares)", filled, pm_ask)
+        pm_resp = await self.pm.place_market_buy(str(pm_token), filled, float(pm_ask))
         pm_fill = fill_from_pm_order(pm_resp, filled)
         self._apply_fill(hedge.pm_leg, pm_fill)
 
@@ -634,9 +633,8 @@ class HedgeEngine:
                 await self.pm.cancel_order(pm_fill.order_id)
             except Exception:
                 pass
-            # one aggressive retry at a slightly worse price
-            worse = min(0.99, round(float(pm_ask) + 0.02, 2))
-            pm_resp2 = await self.pm.place_market_buy(str(pm_token), filled, worse)
+            # Retry once with same equal-share size (FOK may miss once)
+            pm_resp2 = await self.pm.place_market_buy(str(pm_token), filled, float(pm_ask))
             pm_fill = fill_from_pm_order(pm_resp2, filled)
             self._apply_fill(hedge.pm_leg, pm_fill)
             if pm_fill.status == "SUBMITTED" and pm_fill.order_id:
@@ -661,6 +659,12 @@ class HedgeEngine:
                 pm_fill.shares, hedge.pm_leg.entry_price,
                 hedge.entry_sum,
             )
+            # Re-pull real avg/shares from venues at T+30s and T+90s (API lag)
+            try:
+                import asyncio as _aio
+                _aio.create_task(self._delayed_reconcile(hedge, delays=(30.0, 90.0), phase="open"))
+            except Exception as e:
+                logger.warning("schedule delayed reconcile: %s", e)
         elif pf_fill.status == "FILLED" or pm_fill.status == "FILLED":
             hedge.status = "PARTIAL"
             self._entry_busy = False
@@ -750,9 +754,8 @@ class HedgeEngine:
                         logger.info("PM cancel before retry %s", hedge.pm_leg.order_id[:18])
                     except Exception as e:
                         logger.warning("PM cancel before retry: %s", e)
-                # bump limit so notional stays >= $1 even if ask is tiny
-                px = min(0.99, round(float(ask) + 0.03, 2))
-                resp = await self.pm.place_market_buy(hedge.pm_leg.token_or_market, size, px)
+                # Pass real ask — equal shares; min-notional bump inside polymarket_buy_order
+                resp = await self.pm.place_market_buy(hedge.pm_leg.token_or_market, size, float(ask))
                 fill = fill_from_pm_order(resp, size)
                 if fill.status == "SUBMITTED" and fill.order_id:
                     try:
@@ -770,6 +773,101 @@ class HedgeEngine:
                 hedge.id, hedge.entry_sum,
                 hedge.pf_leg.filled_shares, hedge.pf_leg.entry_price,
                 hedge.pm_leg.filled_shares, hedge.pm_leg.entry_price,
+            )
+            try:
+                import asyncio as _aio
+                _aio.create_task(self._delayed_reconcile(hedge, delays=(30.0, 90.0), phase="open"))
+            except Exception as e:
+                logger.warning("schedule delayed reconcile: %s", e)
+
+
+    async def _delayed_reconcile(self, hedge: Hedge, delays: tuple = (30.0, 90.0), phase: str = "open") -> None:
+        """After OPEN/CLOSE, re-fetch venue positions so UI avg/shares match reality."""
+        import asyncio as _aio
+        for d in delays:
+            try:
+                await _aio.sleep(d)
+            except Exception:
+                return
+            if hedge.status in ("CLOSED",) and phase == "open":
+                # still ok to refresh closed legs for history accuracy
+                pass
+            if hedge.status not in ("OPEN", "PARTIAL", "CLOSING", "SETTLING", "CLOSED"):
+                return
+            try:
+                await self._reconcile_hedge_from_venues(hedge, reason=f"{phase}+{int(d)}s")
+            except Exception as e:
+                logger.warning("delayed reconcile %s +%ss: %s", hedge.id, int(d), e)
+
+    async def _reconcile_hedge_from_venues(self, hedge: Hedge, reason: str = "") -> None:
+        """Pull PF position cost + shares; keep PM fill as recorded (CLOB has no easy position avg)."""
+        if not self.settings.is_live:
+            return
+        changed = False
+        # Predict.fun
+        try:
+            is_yes = hedge.pf_leg.direction == "up"
+            mid = hedge.pf_leg.token_or_market
+            try:
+                pos = await self.pf.get_position_for_market(mid, is_yes=is_yes)
+            except TypeError:
+                pos = await self.pf.get_position_for_market(mid)
+            if pos and float(pos.get("shares") or 0) > 0:
+                sh = float(pos["shares"])
+                cu = float(pos.get("cost_usd") or 0)
+                ap = float(pos.get("avg_price") or 0)
+                if cu <= 0 and ap > 0:
+                    cu = sh * ap
+                if cu > 0 and sh > 0:
+                    new_px = cu / sh
+                    if 0.01 <= new_px <= 1.0:
+                        old_px = float(hedge.pf_leg.entry_price or 0)
+                        old_sh = float(hedge.pf_leg.filled_shares or 0)
+                        hedge.pf_leg.filled_shares = sh
+                        hedge.pf_leg.shares = sh
+                        hedge.pf_leg.entry_usd = cu
+                        hedge.pf_leg.entry_price = round(new_px, 4)
+                        if abs(old_px - new_px) > 0.005 or abs(old_sh - sh) > 0.05:
+                            changed = True
+                            logger.info(
+                                "PF re-reconcile [%s] shares=%.4f→%.4f avg=%.4f→%.4f usd=%.4f",
+                                reason, old_sh, sh, old_px, new_px, cu,
+                            )
+            # Activity fallback if still looks like limit
+            if hedge.pf_leg.entry_price and hedge.pf_leg.entry_price > 0:
+                act = await self.pf.get_fill_price_from_activity(
+                    mid, order_id=hedge.pf_leg.order_id or "", limit_price=float(hedge.pf_leg.entry_price or 0),
+                )
+                if act:
+                    cu = float(act.get("cost_usd") or 0)
+                    ap = float(act.get("avg_price") or 0)
+                    ash = float(act.get("shares") or 0) or float(hedge.pf_leg.filled_shares or 0)
+                    if cu > 0 and ash > 0:
+                        new_px = cu / ash
+                        if 0.01 <= new_px <= 1.0 and (
+                            hedge.pf_leg.entry_price <= 0
+                            or new_px < float(hedge.pf_leg.entry_price) * 0.98
+                            or abs(new_px - float(hedge.pf_leg.entry_price or 0)) > 0.02
+                        ):
+                            old_px = float(hedge.pf_leg.entry_price or 0)
+                            hedge.pf_leg.filled_shares = ash
+                            hedge.pf_leg.shares = ash
+                            hedge.pf_leg.entry_usd = cu
+                            hedge.pf_leg.entry_price = round(new_px, 4)
+                            changed = True
+                            logger.info(
+                                "PF activity re-reconcile [%s] avg=%.4f→%.4f usd=%.4f",
+                                reason, old_px, new_px, cu,
+                            )
+        except Exception as e:
+            logger.warning("PF re-reconcile [%s]: %s", reason, e)
+
+        if changed:
+            self._refresh_entry_sum(hedge)
+            logger.info(
+                "Hedge %s entry_sum refreshed → %.3f (PF %.4f + PM %.4f) [%s]",
+                hedge.id, hedge.entry_sum,
+                hedge.pf_leg.entry_price, hedge.pm_leg.entry_price, reason,
             )
 
     async def _try_exit(self, hedge: Hedge, now: float) -> None:
@@ -1191,6 +1289,13 @@ class HedgeEngine:
             pm_pnl,
             hedge.pnl,
         )
+
+        try:
+            import asyncio as _aio
+            _aio.create_task(self._delayed_reconcile(hedge, delays=(30.0, 90.0), phase="close"))
+        except Exception:
+            pass
+
 
     async def test_buy(self, usd: float = 1.0) -> dict:
         """One Predict buy, no Polymarket. Proves the order path."""
