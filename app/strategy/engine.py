@@ -1646,36 +1646,36 @@ class HedgeEngine:
                 except Exception as e:
                     logger.warning("PM final resolution error: %s", e)
 
-            # After long wait: prefer a single outcome. PM uses Chainlink TWAP
-            # (same as the market rules). Independent settle when venues disagree
-            # zeros BOTH legs of a hedge — catastrophic. Always align to PM if known.
+            # After long wait:
+            # - missing one side → fill from the known venue (lag)
+            # - TRUE disagreement (both known, opposite) → settle EACH leg by its
+            #   own venue. Forcing PM onto PF caused fake wins when PF really
+            #   resolved the other way (see hedge 6c6d7829: PF Down / PM Up).
             if pf_up_won is None and pm_up_won is not None:
                 pf_up_won = pm_up_won
                 logger.warning(
-                    "Hedge %s PF unknown after wait — using PM pm_up=%s for both",
+                    "Hedge %s PF unknown after wait — using PM pm_up=%s for PF leg only",
                     hedge.id, pm_up_won,
                 )
             elif pm_up_won is None and pf_up_won is not None:
                 pm_up_won = pf_up_won
                 logger.warning(
-                    "Hedge %s PM unknown after wait — using PF pf_up=%s for both",
+                    "Hedge %s PM unknown after wait — using PF pf_up=%s for PM leg only",
                     hedge.id, pf_up_won,
                 )
             elif pf_up_won is None and pm_up_won is None:
-                pf_up_won = True
-                pm_up_won = True
+                # Last resort: do not invent wins. Leave None → legs exit 0.
                 logger.warning(
-                    "Hedge %s NO resolution data after wait — fallback Up/Up",
+                    "Hedge %s NO resolution data after wait — both legs exit 0",
                     hedge.id,
                 )
             elif pf_up_won != pm_up_won:
-                # Prefer PM (oracle). PF API often lags / wrong for minutes.
                 logger.warning(
-                    "Hedge %s DIVERGENCE after wait pf_up=%s pm_up=%s — "
-                    "TRUSTING PM (Chainlink) for both legs",
+                    "Hedge %s TRUE DIVERGENCE after wait pf_up=%s pm_up=%s — "
+                    "settle each leg independently (PF by PF, PM by PM)",
                     hedge.id, pf_up_won, pm_up_won,
                 )
-                pf_up_won = pm_up_won
+                # keep both values as-is; per-leg won_up uses venue-specific flag
             logger.info(
                 "Hedge %s resolution final pf_up=%s pm_up=%s (slug=%s t+%.0fs)",
                 hedge.id, pf_up_won, pm_up_won, slug, wait_s,
@@ -1733,9 +1733,11 @@ class HedgeEngine:
                 leg.status = "CLOSED"
                 leg.exit_price = leg.exit_price or 0.0
                 continue
-            # Per-venue outcome
+            # Per-venue outcome (None → treat as loss / exit 0 — never invent a win)
             won_up = pf_up_won if leg.venue in ("predict", "pf", "bn") else pm_up_won
-            if leg.direction == "up":
+            if won_up is None:
+                leg.exit_price = 0.0
+            elif leg.direction == "up":
                 leg.exit_price = 1.0 if won_up else 0.0
             else:
                 leg.exit_price = 0.0 if won_up else 1.0
