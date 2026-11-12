@@ -61,12 +61,14 @@ def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float
     """Share-sized BUY for Polymarket CLOB.
 
     Default: size ≈ target_shares (equal to PF), quantized for CLOB rules.
-    Only if notional < $1.05 (cheap ask), bump size so spend ≈ $1.20–$1.50.
-    Always quantize so maker USDC has ≤2 decimals (avoids 400 invalid amounts).
+    Only if notional < $1.05 (cheap ask), bump size so spend ≈ $1.05–$1.25.
+    Never inflate more than max(target*1.5, target+8) — if $1 min still
+    requires a much larger size (e.g. ask=1¢ → need ~100 sh), return (0,0)
+    so the engine can abort/unwind instead of opening a 5× imbalance.
     """
     MIN_NOTIONAL = 1.05
-    BUMP_USD = 1.20
-    MAX_BUMP_USD = 1.50
+    BUMP_USD = 1.15
+    MAX_BUMP_USD = 1.25
     if ask is None or ask <= 0 or target_shares is None or target_shares <= 0:
         return 0.0, 0.0
     ask = float(ask)
@@ -88,23 +90,35 @@ def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float
     if notional < MIN_NOTIONAL and limit > 0:
         need = min(MAX_BUMP_USD, max(BUMP_USD, MIN_NOTIONAL))
         raw = need / limit
-        # never more than ~target * (need / (target*ask)) roughly; hard cap 2x target or 15 shares
-        raw = min(raw, max(target * 2.5, 15.0))
+        # Hard cap: never more than 1.5× target or +8 shares (whichever larger).
+        # At ask=0.01, $1 needs ~100 sh — that would be a huge imbalance; refuse.
+        max_size = max(target * 1.5, target + 8.0)
+        if raw > max_size + 1e-9:
+            # Cannot meet CLOB $1 min without destroying hedge ratio
+            return 0.0, 0.0
+        raw = min(raw, max_size)
         size = _quantize_buy_size(raw, limit)
-        # walk up if still under min after quantize
-        if size * limit < MIN_NOTIONAL:
+        # walk up if still under min after quantize (within cap)
+        if size > 0 and size * limit < MIN_NOTIONAL:
             units = int(math.floor(size * 10000 + 1e-9)) + 1
-            while units < 200000:  # safety
+            max_units = int(math.floor(max_size * 10000 + 1e-9))
+            limit_cents = int(round(limit * 100))
+            while units <= max_units:
                 cand = units / 10000.0
-                if (units * int(round(limit * 100))) % 10000 == 0 and cand * limit >= MIN_NOTIONAL:
+                if (units * limit_cents) % 10000 == 0 and cand * limit >= MIN_NOTIONAL:
                     size = cand
                     break
                 units += 1
+            else:
+                # still under min within allowed size → refuse
+                return 0.0, 0.0
 
     if size <= 0:
         return 0.0, 0.0
     # final safety quantize
     size = _quantize_buy_size(size, limit) or size
+    if size * limit < MIN_NOTIONAL - 1e-9:
+        return 0.0, 0.0
     return limit, size
 
 
@@ -468,7 +482,13 @@ class PolymarketClient:
             ask = float(price)
             limit, size = polymarket_buy_order(shares, ask)
             if size <= 0 or limit <= 0:
-                return {"status": "REJECTED", "reason": "no Polymarket ask / zero size"}
+                # Either no ask, or $1 min would require size >> PF shares (e.g. ask=1¢)
+                reason = (
+                    f"PM min-notional impossible at ask={ask:.4f} for {shares:.2f} sh "
+                    f"(would need ~{1.15/max(ask,0.001):.0f} sh) — refuse imbalance"
+                )
+                logger.warning(reason)
+                return {"status": "REJECTED", "reason": reason, "avgPrice": ask}
             # size already quantized so size*limit is exact cents (maker 2dp)
             maker = round(size * limit, 2)
             logger.info(
@@ -487,31 +507,43 @@ class PolymarketClient:
         try:
             args = OrderArgs(token_id=token_id, price=px, size=sz, side=order_side)
             signed = client.create_order(args)
-            # BUY: FAK = share-sized fill-and-kill (caps shares, no dollar-market overfill).
-            # SELL: FOK preferred for full exit; fall back FAK.
-            # Both legs: FAK — fill what's available (FOK kills entire exit on thin book)
-            order_type = getattr(OrderType, "FAK", None) or getattr(OrderType, "FOK", None) or OrderType.GTC
+            # BUY entry: GTC resting limit (simultaneous with PF). FAK fails when book
+            # is thin at exact cent ("no orders found to match") → leaves PF naked.
+            # SELL exit: FAK/FOK preferred for immediate liquidity.
+            if side == "BUY":
+                order_type = getattr(OrderType, "GTC", None) or OrderType.GTC
+            else:
+                order_type = (
+                    getattr(OrderType, "FAK", None)
+                    or getattr(OrderType, "FOK", None)
+                    or OrderType.GTC
+                )
             try:
                 resp = client.post_order(signed, order_type)
             except Exception as e1:
                 msg = str(e1)
                 logger.warning("PM post_order %s failed (%s)", order_type, msg)
-                # FAK with no book match: one aggressive retry at limit+2¢ (new signature)
+                # If somehow FAK was used and no match → fall back to GTC resting
                 if (
                     side == "BUY"
                     and ("no orders found" in msg.lower() or "fak" in msg.lower())
                     and px < 0.97
                 ):
                     try:
-                        px2 = min(0.99, round(float(px) + 0.02, 2))
+                        gtc = getattr(OrderType, "GTC", None) or OrderType.GTC
+                        px2 = min(0.99, round(float(px) + 0.01, 2))
                         sz2 = _quantize_buy_size(float(sz), px2) or float(sz)
-                        logger.info("PM FAK no-match retry size=%.4f limit=%.2f→%.2f", sz2, px, px2)
+                        logger.info(
+                            "PM BUY no-match → GTC rest size=%.4f limit=%.2f→%.2f",
+                            sz2, px, px2,
+                        )
                         args2 = OrderArgs(token_id=token_id, price=px2, size=sz2, side=BUY)
                         signed2 = client.create_order(args2)
-                        resp = client.post_order(signed2, order_type)
+                        resp = client.post_order(signed2, gtc)
                         px, sz = px2, sz2
+                        order_type = gtc
                     except Exception as e2:
-                        logger.warning("PM FAK retry failed (%s)", e2)
+                        logger.warning("PM GTC fallback failed (%s)", e2)
                         return {"status": "REJECTED", "reason": msg, "avgPrice": px}
                 else:
                     return {"status": "REJECTED", "reason": msg, "avgPrice": px}

@@ -441,9 +441,8 @@ class HedgeEngine:
         self.hedges.append(hedge)
 
         # Simultaneous LIMIT buys on both venues with the SAME share target.
-        # PF: aggressive limit (ask+slip), size inflated for ~2% fee so net ≈ target.
-        # PM: share-sized FAK limit at ask (NOT dollar-market FOK — that over-fills shares).
-        # Wait ~6s for fills; retry the missing leg once.
+        # PF: aggressive limit (ask+slip). PM: GTC resting limit at ask (not FAK —
+        # FAK fails on thin books and left PF naked). Wait ~7s for fills.
         import asyncio as _asyncio
 
         # Same share count on both venues. Do NOT inflate for fee — that caused
@@ -498,8 +497,8 @@ class HedgeEngine:
         pf_fill = fill_from_predict(pf_resp, order_shares)
         pm_fill = fill_from_pm_order(pm_resp, target_net)
 
-        # Wait for SUBMITTED → FILLED (both venues can ack before match)
-        wait_deadline = time.time() + 6.5
+        # Wait for SUBMITTED → FILLED. PM is now GTC resting — poll, do NOT cancel early.
+        wait_deadline = time.time() + 7.0
         while time.time() < wait_deadline:
             need_wait = False
             if pf_fill.status == "SUBMITTED" and pf_fill.order_id:
@@ -512,7 +511,6 @@ class HedgeEngine:
                             pf_fill = got
                 except Exception:
                     pass
-                # Also check position
                 if pf_fill.status != "FILLED":
                     try:
                         pos = await self.pf.get_position_for_market(
@@ -531,16 +529,49 @@ class HedgeEngine:
                         pass
             if pm_fill.status == "SUBMITTED" and pm_fill.order_id:
                 need_wait = True
-                # Cancel resting GTC if any — we use FAK so should be rare
                 try:
-                    await self.pm.cancel_order(pm_fill.order_id)
+                    st = await self.pm.get_order(pm_fill.order_id)
+                    if st:
+                        got = fill_from_pm_order(st, target_net)
+                        if got.status == "FILLED" and got.shares > 0.5:
+                            pm_fill = got
+                            logger.info(
+                                "PM GTC filled during wait %.4f@%.4f",
+                                got.shares, got.price or 0,
+                            )
                 except Exception:
                     pass
-            if pf_fill.status == "FILLED" and pm_fill.status in ("FILLED", "REJECTED"):
+            if pf_fill.status == "FILLED" and pm_fill.status == "FILLED":
                 break
-            if not need_wait and pf_fill.status != "SUBMITTED":
+            if pf_fill.status == "FILLED" and pm_fill.status == "REJECTED":
                 break
-            await _asyncio.sleep(0.6)
+            if not need_wait and pf_fill.status != "SUBMITTED" and pm_fill.status != "SUBMITTED":
+                break
+            await _asyncio.sleep(0.7)
+
+        # After wait: if PM still resting (GTC unfilled), cancel so we don't leave
+        # orphan order; manage_partial can re-place at updated ask.
+        if pm_fill.status == "SUBMITTED" and pm_fill.order_id:
+            try:
+                st = await self.pm.get_order(pm_fill.order_id)
+                if st:
+                    got = fill_from_pm_order(st, target_net)
+                    if got.status == "FILLED" and got.shares > 0.5:
+                        pm_fill = got
+            except Exception:
+                pass
+            if pm_fill.status != "FILLED":
+                try:
+                    await self.pm.cancel_order(pm_fill.order_id)
+                    logger.info("PM GTC cancel after wait (unfilled) id=%s", pm_fill.order_id[:18])
+                except Exception as e:
+                    logger.debug("PM cancel after wait: %s", e)
+                pm_fill = Fill(
+                    status="REJECTED",
+                    reason="GTC unfilled after wait",
+                    order_id=pm_fill.order_id,
+                    price=pm_fill.price,
+                )
 
         # Cap PF shares to target (positions API can return total market size)
         if pf_fill.status == "FILLED" and pf_fill.shares > target_net * 1.05:
@@ -1062,41 +1093,83 @@ class HedgeEngine:
                 _, ask = self._pm_best(hedge.pm_leg.direction)
                 size = float(hedge.pf_leg.filled_shares or hedge.pf_leg.requested_shares or 0)
                 if ask and size > 0:
-                    # Do NOT chase a worse PM price after PF already filled.
-                    # Abort the pair if combined entry would exceed ENTRY_SUM_MAX + small slack.
+                    # Do NOT chase a much worse PM price after PF already filled.
                     pf_px = float(hedge.pf_leg.entry_price or 0)
                     projected = pf_px + float(ask)
-                    max_ok = float(self.settings.entry_sum_max) + 0.03  # 3¢ slack for fee/slip
+                    max_ok = float(self.settings.entry_sum_max) + 0.05  # 5¢ slack for GTC fill
                     if pf_px > 0 and projected > max_ok:
                         logger.warning(
                             "Hedge %s ABORT PM retry: projected entry_sum=%.3f "
-                            "(pf@%.3f + pm_ask@%.3f) > max %.3f — leave PARTIAL, no chase",
+                            "(pf@%.3f + pm_ask@%.3f) > max %.3f — UNWIND PF (naked risk)",
                             hedge.id, projected, pf_px, float(ask), max_ok,
                         )
                         hedge.pm_leg.status = "REJECTED"
                         hedge.pm_leg.reject_reason = (
                             f"retry ask too high ({projected:.3f} > {max_ok:.3f})"
                         )
-                        # Mark closed as aborted loss on PF only so recovery sees real PF loss
-                        # but do NOT promote to OPEN with bad sum.
+                        # Critical: do NOT leave PF naked. Market-sell PF to close.
+                        try:
+                            await self._unwind_pf_leg(hedge)
+                        except Exception as e:
+                            logger.error("PF unwind after PM abort failed: %s", e)
                         return
-                    if hedge.pm_leg.order_id and hedge.pm_leg.status == "SUBMITTED":
+                    # Cancel any previous resting PM order before new one
+                    if hedge.pm_leg.order_id and hedge.pm_leg.status in ("SUBMITTED", "REJECTED"):
                         try:
                             await self.pm.cancel_order(hedge.pm_leg.order_id)
-                            logger.info("PM cancel before retry %s", hedge.pm_leg.order_id[:18])
+                            logger.info("PM cancel before retry %s", str(hedge.pm_leg.order_id)[:18])
                         except Exception as e:
-                            logger.warning("PM cancel before retry: %s", e)
+                            logger.debug("PM cancel before retry: %s", e)
+                    # Place GTC at current ask; wait briefly for fill
                     resp = await self.pm.place_market_buy(
                         hedge.pm_leg.token_or_market, size, float(ask),
                     )
                     fill = fill_from_pm_order(resp, size)
                     if fill.status == "SUBMITTED" and fill.order_id:
-                        try:
-                            await self.pm.cancel_order(fill.order_id)
-                        except Exception:
-                            pass
-                        fill = Fill(status="REJECTED", reason="PM resting on retry", order_id=fill.order_id)
+                        import asyncio as _aio
+                        for _ in range(8):  # ~5.6s
+                            await _aio.sleep(0.7)
+                            try:
+                                st = await self.pm.get_order(fill.order_id)
+                                if st:
+                                    got = fill_from_pm_order(st, size)
+                                    if got.status == "FILLED" and got.shares > 0.5:
+                                        fill = got
+                                        break
+                            except Exception:
+                                pass
+                        if fill.status != "FILLED":
+                            try:
+                                await self.pm.cancel_order(fill.order_id)
+                                logger.info(
+                                    "PM GTC retry unfilled → cancel id=%s",
+                                    str(fill.order_id)[:18],
+                                )
+                            except Exception:
+                                pass
+                            fill = Fill(
+                                status="REJECTED",
+                                reason="GTC unfilled on retry",
+                                order_id=fill.order_id,
+                                price=fill.price,
+                            )
                     self._apply_fill(hedge.pm_leg, fill)
+                    # If PM cannot meet $1 min without huge size imbalance → unwind PF
+                    reason = (getattr(fill, "reason", None) or "") if fill else ""
+                    if fill.status == "REJECTED" and (
+                        "min-notional" in str(reason).lower()
+                        or "min size" in str(reason).lower()
+                        or "impossible" in str(reason).lower()
+                    ):
+                        logger.warning(
+                            "Hedge %s PM min-notional reject — UNWIND PF",
+                            hedge.id,
+                        )
+                        try:
+                            await self._unwind_pf_leg(hedge)
+                        except Exception as e:
+                            logger.error("PF unwind after min-notional: %s", e)
+                        return
 
         if hedge.pf_leg.status == "FILLED" and hedge.pm_leg.status == "FILLED":
             self._refresh_entry_sum(hedge)
@@ -1340,6 +1413,39 @@ class HedgeEngine:
         hedge.close_reason = "EXIT"
         hedge.status = "CLOSING"
         await self._sell_both(hedge)
+
+    async def _unwind_pf_leg(self, hedge: Hedge) -> None:
+        """Sell the PF leg when PM never filled — avoid naked directional risk.
+        Records realized PnL on PF only and closes the hedge as aborted.
+        """
+        if hedge.pf_leg.status not in ("FILLED", "PARTIAL"):
+            hedge.status = "CLOSED"
+            return
+        logger.warning(
+            "Hedge %s UNWIND PF only (PM never filled) shares=%.4f @entry=%.4f",
+            hedge.id, hedge.pf_leg.filled_shares or 0, hedge.pf_leg.entry_price or 0,
+        )
+        await self._sell_leg(hedge.pf_leg, "PF")
+        # PnL = exit proceeds − entry cost on PF; PM = 0
+        pf_cost = float(hedge.pf_leg.entry_usd or 0)
+        pf_exit = float(hedge.pf_leg.exit_usd or 0)
+        if pf_exit <= 0 and hedge.pf_leg.status == "CLOSED":
+            # dust / full loss path
+            pf_exit = 0.0
+        pnl = pf_exit - pf_cost
+        hedge.pnl = round(pnl, 4)
+        hedge.status = "CLOSED"
+        hedge.exit_sum = float(hedge.pf_leg.exit_price or 0)
+        logger.info(
+            "Hedge %s UNWIND CLOSED pf_pnl=%.4f (exit=%.4f cost=%.4f) — recovery will size up",
+            hedge.id, pnl, pf_exit, pf_cost,
+        )
+        try:
+            self.recovery.on_pair_closed(
+                hedge.id, pnl, 0.0, 0.0, hedge.pf_leg.filled_shares or 0,
+            )
+        except Exception as e:
+            logger.warning("recovery on unwind: %s", e)
 
     async def _sell_both(self, hedge: Hedge) -> None:
         await asyncio.gather(
