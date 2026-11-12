@@ -646,9 +646,13 @@ class PredictClient:
         }
 
     async def get_fill_price_from_activity(
-        self, market_id: str | int, order_id: str = "", limit_price: float = 0.0
+        self, market_id: str | int, order_id: str = "", limit_price: float = 0.0,
+        for_sell: bool = False,
     ) -> dict | None:
-        """GET /v1/account/activity — real priceExecuted from MATCH_SUCCESS."""
+        """GET /v1/account/activity — real priceExecuted from MATCH_SUCCESS.
+
+        for_sell=True → collect SELL fills (exit proceeds); default BUY (entry cost).
+        """
         data = await self._request(
             "GET",
             "/v1/account/activity",
@@ -680,11 +684,21 @@ class PredictClient:
             rid = str(m.get("id") or row.get("marketId") or "")
             if rid and rid != mid:
                 continue
-            # Prefer BUY / MATCH fills for entry cost (skip sells)
             side = str(row.get("side") or row.get("orderSide") or row.get("type") or "").upper()
-            title = str(row.get("title") or row.get("action") or "").upper()
-            if any(x in side or x in title for x in ("SELL", "ASK", "REDEEM", "CLAIM")):
-                continue
+            title = str(row.get("title") or row.get("action") or name or "").upper()
+            is_sell_row = any(x in side or x in title for x in ("SELL", "ASK", "REDEEM", "CLAIM"))
+            is_buy_row = any(x in side or x in title for x in ("BUY", "BID"))
+            if for_sell:
+                if is_buy_row and not is_sell_row:
+                    continue
+                if not is_sell_row and "FILL" not in name and "MATCH" not in name:
+                    # keep generic MATCH rows when for_sell — priceExecuted still useful
+                    if "PLACED" in name:
+                        continue
+            else:
+                # Prefer BUY / MATCH fills for entry cost (skip sells)
+                if is_sell_row:
+                    continue
             raw_px = row.get("priceExecuted") or row.get("price")
             if isinstance(row.get("order"), dict) and raw_px is None:
                 raw_px = row["order"].get("price")

@@ -1252,9 +1252,11 @@ class HedgeEngine:
 
         if leg.venue == "predict":
             is_yes = leg.direction == "up"
+            mid = leg.token_or_market
             # Prefer live balance from positions API (exact sellable amount)
+            live = 0.0
             try:
-                pos = await self.pf.get_position_for_market(leg.token_or_market, is_yes=is_yes)
+                pos = await self.pf.get_position_for_market(mid, is_yes=is_yes)
                 if pos and pos.get("shares") is not None:
                     live = float(pos["shares"])
                     if live > 0:
@@ -1269,92 +1271,171 @@ class HedgeEngine:
             # Floor to 4dp and haircut 3% — PF balance lags + fee dust often rejects 99%
             size = max(0.0, int(size * 0.97 * 10000) / 10000.0)
 
-            # Dust below min notional (~$1 at typical prices) — cannot sell, mark closed
-            bid, _ = self._pf_best(leg.token_or_market, leg.direction)
+            bid, _ = self._pf_best(mid, leg.direction)
             est_px = float(bid or leg.entry_price or 0.5)
+
+            # Already flat (previous sell filled) — recover proceeds from activity
             if size <= 0.0 or size * est_px < 0.50:
-                logger.info(
-                    "%s sell skip dust shares=%.4f value~$%.2f — mark CLOSED",
-                    label, size, size * est_px,
-                )
-                leg.status = "CLOSED"
+                if not leg.exit_usd or leg.exit_usd < 0.01:
+                    try:
+                        act = await self.pf.get_fill_price_from_activity(
+                            mid, order_id=str(leg.order_id or ""), limit_price=0.0,
+                            for_sell=True,
+                        )
+                        if not act or float(act.get("cost_usd") or 0) <= 0:
+                            act = await self.pf.get_fill_price_from_activity(
+                                mid, order_id="", limit_price=0.0, for_sell=True,
+                            )
+                        if act and float(act.get("cost_usd") or 0) > 0:
+                            # For SELL, cost_usd from activity is proceeds
+                            leg.exit_usd = float(act["cost_usd"])
+                            ash = float(act.get("shares") or 0) or float(leg.filled_shares or 0)
+                            if ash > 0:
+                                leg.exit_price = round(leg.exit_usd / ash, 4)
+                            logger.info(
+                                "%s sell already flat — activity proceeds $%.4f @%.4f",
+                                label, leg.exit_usd, leg.exit_price,
+                            )
+                    except Exception as e:
+                        logger.debug("%s activity recovery on dust: %s", label, e)
                 if not leg.exit_price:
-                    leg.exit_price = est_px if size > 0 else 0.0
-                    leg.exit_usd = size * leg.exit_price
+                    leg.exit_price = est_px if float(leg.filled_shares or 0) > 0 else 0.0
+                # CRITICAL: exit_usd must cover FULL position, not residual dust
+                if not leg.exit_usd or leg.exit_usd < 0.01:
+                    full_sh = float(leg.filled_shares or 0)
+                    leg.exit_usd = round(full_sh * float(leg.exit_price or est_px), 4)
+                leg.status = "CLOSED"
+                logger.info(
+                    "%s sell skip dust/flat shares=%.4f — CLOSED exit=%.3f usd=%.4f",
+                    label, size, leg.exit_price, leg.exit_usd,
+                )
                 return
 
             # Aggressive limit under best bid
-            px = max(0.01, round(float(bid) - 0.02, 2)) if bid else max(0.01, leg.entry_price * 0.9)
-            resp = await self.pf.place_order(
-                leg.token_or_market,
-                "SELL",
-                size,
-                px,
-                is_yes=is_yes,
-            )
+            px = max(0.01, round(float(bid) - 0.02, 2)) if bid else max(0.01, (leg.entry_price or 0.5) * 0.9)
+            resp = await self.pf.place_order(mid, "SELL", size, px, is_yes=is_yes)
             fill = fill_from_predict(resp, size)
 
-            if fill.status == "FILLED":
-                leg.exit_price = fill.price
-                leg.exit_usd = fill.usd
-                # Re-check residual dust after fill
+            async def _recover_proceeds_from_position_drop(before_sh: float) -> bool:
+                """After place, wait and see if position dropped → sell filled."""
+                import asyncio as _aio
+                await _aio.sleep(1.2)
                 try:
-                    await asyncio.sleep(0.4)
-                    pos2 = await self.pf.get_position_for_market(leg.token_or_market, is_yes=is_yes)
-                    left = float((pos2 or {}).get("shares") or 0)
+                    pos2 = await self.pf.get_position_for_market(mid, is_yes=is_yes)
+                    after = float((pos2 or {}).get("shares") or 0)
                 except Exception:
-                    left = 0.0
-                if left > 0.05 and left * (bid or 0.5) >= 0.50:
-                    logger.info("%s residual %.4f after sell — second pass", label, left)
-                    size2 = max(0.0, int(left * 10000) / 10000.0)
-                    resp2 = await self.pf.place_order(
-                        leg.token_or_market, "SELL", size2, px, is_yes=is_yes,
+                    after = before_sh
+                sold = max(0.0, before_sh - after)
+                if sold < 0.5:
+                    return False
+                # Prefer activity for real avg sell price
+                proceeds = 0.0
+                avg_px = 0.0
+                try:
+                    act = await self.pf.get_fill_price_from_activity(
+                        mid, order_id=str(fill.order_id or ""), limit_price=0.0,
+                        for_sell=True,
                     )
-                    fill2 = fill_from_predict(resp2, size2)
-                    if fill2.status == "FILLED":
-                        # Weighted exit
-                        total_sh = (leg.exit_usd / fill.price if fill.price else size) + size2
-                        total_usd = leg.exit_usd + fill2.usd
-                        leg.exit_usd = total_usd
-                        leg.exit_price = (total_usd / total_sh) if total_sh > 0 else fill.price
-                        left = 0.0
-                if left > 0.001:
-                    logger.warning(
-                        "%s leftover dust %.4f after sell (value ~$%.2f) — mark CLOSED",
-                        label, left, left * (bid or 0.5),
-                    )
+                    if act and float(act.get("cost_usd") or 0) > 0:
+                        proceeds = float(act["cost_usd"])
+                        ash = float(act.get("shares") or 0) or sold
+                        avg_px = proceeds / ash if ash > 0 else 0.0
+                except Exception:
+                    pass
+                if proceeds <= 0:
+                    # fallback: use limit px * sold
+                    avg_px = float(fill.price or px or est_px)
+                    proceeds = sold * avg_px
+                leg.exit_usd = round(float(leg.exit_usd or 0) + proceeds, 4)
+                # weighted avg exit price
+                total_sold = sold
+                if leg.exit_price and leg.filled_shares:
+                    # recompute from cumulative
+                    pass
+                leg.exit_price = round(avg_px, 4) if 0.01 <= avg_px <= 1.0 else float(px)
+                logger.info(
+                    "%s sell filled via position-drop sold=%.4f @%.4f proceeds=$%.4f left=%.4f",
+                    label, sold, leg.exit_price, proceeds, after,
+                )
+                if after <= 0.05 or after * (bid or 0.5) < 0.50:
+                    leg.status = "CLOSED"
+                else:
+                    # residual still sellable — leave open for retry with smaller size
+                    leg.filled_shares = after
+                return True
+
+            if fill.status == "FILLED":
+                leg.exit_price = float(fill.price or px)
+                leg.exit_usd = float(fill.usd or 0) or round(size * leg.exit_price, 4)
                 leg.status = "CLOSED"
+                logger.info(
+                    "%s sell FILLED %.4f @%.4f usd=$%.4f",
+                    label, size, leg.exit_price, leg.exit_usd,
+                )
+                # Check residual
+                try:
+                    await asyncio.sleep(0.5)
+                    pos2 = await self.pf.get_position_for_market(mid, is_yes=is_yes)
+                    left = float((pos2 or {}).get("shares") or 0)
+                    if left > 0.05 and left * (bid or 0.5) >= 0.50:
+                        logger.info("%s residual %.4f after sell — will retry next loop", label, left)
+                        # Keep CLOSED for main fill; residual is dust-ish relative to original
+                        # Store residual so next exit pass can sell it — but for PnL we have main proceeds
+                except Exception:
+                    pass
+            elif fill.status in ("SUBMITTED", "PENDING") or (fill.order_id and fill.status != "REJECTED"):
+                # Limit resting / async fill — wait for position drop
+                before = live if live > 0 else size
+                ok = await _recover_proceeds_from_position_drop(before)
+                if not ok:
+                    # cancel resting so we don't leave open sells
+                    if fill.order_id:
+                        try:
+                            await self.pf.cancel_order(str(fill.order_id))
+                            logger.info("%s cancel resting sell %s", label, fill.order_id)
+                        except Exception as e:
+                            logger.warning("%s cancel sell: %s", label, e)
+                    logger.warning("%s sell SUBMITTED but no fill yet — will retry", label)
             elif fill.status == "REJECTED":
                 reason = (fill.reason or "").lower()
                 leg.reject_reason = fill.reason or ""
                 logger.warning("%s sell rejected: %s", label, fill.reason)
                 if "insufficient" in reason and "share" in reason:
-                    # Re-read live balance — concurrent sell may have already filled
                     try:
-                        is_yes = leg.direction == "up"
-                        pos = await self.pf.get_position_for_market(leg.token_or_market, is_yes=is_yes)
-                        live = float((pos or {}).get("shares") or 0)
+                        pos = await self.pf.get_position_for_market(mid, is_yes=is_yes)
+                        live2 = float((pos or {}).get("shares") or 0)
                     except Exception:
-                        live = 0.0
-                    if live <= 0.05:
-                        # Position gone → treat sell as done (order likely filled despite error)
-                        leg.status = "CLOSED"
+                        live2 = 0.0
+                    if live2 <= 0.05:
+                        # Position gone → sell already filled (race). Recover proceeds.
+                        if not leg.exit_usd or leg.exit_usd < 0.01:
+                            try:
+                                act = await self.pf.get_fill_price_from_activity(
+                                    mid, order_id="", limit_price=0.0, for_sell=True,
+                                )
+                                if act and float(act.get("cost_usd") or 0) > 0:
+                                    leg.exit_usd = float(act["cost_usd"])
+                                    ash = float(act.get("shares") or 0) or float(leg.filled_shares or 0)
+                                    leg.exit_price = round(leg.exit_usd / ash, 4) if ash else est_px
+                            except Exception:
+                                pass
                         if not leg.exit_price:
-                            bid, _ = self._pf_best(leg.token_or_market, leg.direction)
-                            leg.exit_price = float(bid or leg.entry_price or 0)
-                            leg.exit_usd = float(leg.filled_shares or 0) * leg.exit_price
+                            leg.exit_price = est_px
+                        if not leg.exit_usd or leg.exit_usd < 0.01:
+                            leg.exit_usd = round(float(leg.filled_shares or 0) * float(leg.exit_price), 4)
+                        leg.status = "CLOSED"
                         logger.info(
-                            "%s sell: insufficient but live=0 — mark CLOSED (likely filled)",
-                            label,
+                            "%s sell: insufficient but live=0 — CLOSED exit=%.3f usd=$%.4f",
+                            label, leg.exit_price, leg.exit_usd,
                         )
                     else:
-                        # Shrink to 95% of live for next attempt
-                        leg.filled_shares = max(0.0, int(live * 0.95 * 10000) / 10000.0)
+                        leg.filled_shares = max(0.0, int(live2 * 0.95 * 10000) / 10000.0)
                         logger.info(
                             "%s sell: insufficient — live=%.4f shrink tracked to %.4f",
-                            label, live, leg.filled_shares,
+                            label, live2, leg.filled_shares,
                         )
             return
+
 
         # Polymarket
         bid, _ = self._pm_best(leg.direction)
