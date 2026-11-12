@@ -280,7 +280,22 @@ class PredictClient:
         outcomes = mkt.get("outcomes") or []
         if not isinstance(outcomes, list) or not outcomes:
             return None
-        # Look for WON on Up/Yes or Down/No
+        # Log raw outcome statuses for debugging false divergence
+        try:
+            snap = [
+                {
+                    "name": o.get("name"),
+                    "status": o.get("status"),
+                    "indexSet": o.get("indexSet"),
+                }
+                for o in outcomes if isinstance(o, dict)
+            ]
+            logger.info(
+                "PF market %s status=%s outcomes=%s",
+                market_id, status, snap,
+            )
+        except Exception:
+            pass
         up_won = None
         for o in outcomes:
             if not isinstance(o, dict):
@@ -296,7 +311,6 @@ class PredictClient:
             elif is_down:
                 up_won = ost != "WON" if up_won is None else up_won
         if up_won is None and status in ("RESOLVED", "CLOSED", "SETTLED"):
-            # fallback: resolution object
             res = mkt.get("resolution") if isinstance(mkt.get("resolution"), dict) else {}
             rname = str(res.get("name") or "").lower()
             if rname in ("up", "yes"):

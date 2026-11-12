@@ -446,9 +446,10 @@ class HedgeEngine:
         # Wait ~6s for fills; retry the missing leg once.
         import asyncio as _asyncio
 
-        fee_bps = int(getattr(self, "_pf_fee_bps", 200) or 200)
-        fee_mult = 1.0 - fee_bps / 10000.0
-        order_shares = round(float(shares) / fee_mult, 4) if fee_mult > 0 else float(shares)
+        # Same share count on both venues. Do NOT inflate for fee — that caused
+        # confusion and double-fill tracking (6 vs 12). Fee is paid in cash/shares
+        # by the venue; we track actual fill after the fact.
+        order_shares = round(float(shares), 4)
         target_net = float(shares)
         pf_px = min(0.99, round(float(pf_ask) + 0.03, 2))
         pm_px = min(0.99, round(float(pm_ask) + 0.01, 2))  # 1¢ slip to cross
@@ -458,7 +459,34 @@ class HedgeEngine:
             target_net, order_shares, pf_px, target_net, pm_px,
         )
 
+        # Pre-check: if this market already has our side filled (stale leftover or
+        # prior partial), do NOT place another full size buy.
+        pre_live = 0.0
+        try:
+            try:
+                pre_pos = await self.pf.get_position_for_market(pf_m["id"], is_yes=(pf_dir == "up"))
+            except TypeError:
+                pre_pos = await self.pf.get_position_for_market(pf_m["id"])
+            if pre_pos:
+                pre_live = float(pre_pos.get("shares") or 0)
+                if pre_live >= target_net * 0.85:
+                    logger.warning(
+                        "PF pre-check: market %s already has %.4f shares on %s — "
+                        "will NOT place new buy (prevent double-fill)",
+                        pf_m["id"], pre_live, pf_dir,
+                    )
+        except Exception as e:
+            logger.debug("PF pre-check: %s", e)
+
         async def _pf_buy():
+            if pre_live >= target_net * 0.85:
+                # Fake a filled response from existing position
+                return {
+                    "status": "FILLED",
+                    "filledShares": min(pre_live, order_shares * 1.08),
+                    "avgPrice": float((pre_pos or {}).get("avg_price") or pf_px),
+                    "orderId": "pre-existing",
+                }
             return await self.pf.place_order(
                 pf_m["id"], "BUY", order_shares, pf_px, is_yes=(pf_dir == "up"),
             )
@@ -1080,13 +1108,23 @@ class HedgeEngine:
                 if cu <= 0 and ap > 0:
                     cu = sh * ap
                 old_sh = float(hedge.pf_leg.filled_shares or 0)
-                # Only update PRICE from venue avg; never expand size past this hedge's fill.
-                # Position total can include other fills on the same market.
-                if old_sh > 0 and sh > old_sh * 1.08 and hedge.status in ("OPEN", "PARTIAL", "CLOSING"):
-                    logger.info(
-                        "PF re-reconcile [%s] ignore position size %.4f > tracked %.4f (use avg only)",
-                        reason, sh, old_sh,
+                # If live position is ~2x tracked, this is a double-fill on-chain.
+                # Adopt live size so PnL matches reality (do NOT ignore).
+                if old_sh > 0 and sh > old_sh * 1.5 and hedge.status in ("OPEN", "PARTIAL", "CLOSING", "SETTLING"):
+                    new_px = ap if 0.01 <= ap <= 1.0 else (cu / sh if sh else 0)
+                    if not (0.01 <= new_px <= 1.0):
+                        new_px = float(hedge.pf_leg.entry_price or 0) or 0.5
+                    logger.warning(
+                        "PF DOUBLE-FILL detected [%s] live=%.4f tracked=%.4f — adopting live size @%.4f",
+                        reason, sh, old_sh, new_px,
                     )
+                    hedge.pf_leg.filled_shares = round(sh, 4)
+                    hedge.pf_leg.shares = round(sh, 4)
+                    hedge.pf_leg.entry_price = round(new_px, 4)
+                    hedge.pf_leg.entry_usd = round(cu if cu > 0 else sh * new_px, 4)
+                    changed = True
+                elif old_sh > 0 and sh > old_sh * 1.08 and hedge.status in ("OPEN", "PARTIAL", "CLOSING"):
+                    # mild overfill — keep tracked, update avg only
                     if 0.01 <= (ap or (cu / sh if sh else 0)) <= 1.0:
                         new_px = ap if 0.01 <= ap <= 1.0 else (cu / sh)
                         old_px = float(hedge.pf_leg.entry_price or 0)
@@ -1527,8 +1565,9 @@ class HedgeEngine:
                 except Exception as e:
                     logger.warning("PM final resolution error: %s", e)
 
-            # After long wait: fill missing side from the known one; if both known
-            # and still diverge, KEEP independent outcomes (true venue split exists).
+            # After long wait: prefer a single outcome. PM uses Chainlink TWAP
+            # (same as the market rules). Independent settle when venues disagree
+            # zeros BOTH legs of a hedge — catastrophic. Always align to PM if known.
             if pf_up_won is None and pm_up_won is not None:
                 pf_up_won = pm_up_won
                 logger.warning(
@@ -1542,7 +1581,6 @@ class HedgeEngine:
                     hedge.id, pf_up_won,
                 )
             elif pf_up_won is None and pm_up_won is None:
-                # last resort: no data at all
                 pf_up_won = True
                 pm_up_won = True
                 logger.warning(
@@ -1550,11 +1588,13 @@ class HedgeEngine:
                     hedge.id,
                 )
             elif pf_up_won != pm_up_won:
+                # Prefer PM (oracle). PF API often lags / wrong for minutes.
                 logger.warning(
-                    "Hedge %s TRUE DIVERGENCE after wait pf_up=%s pm_up=%s — "
-                    "settling each leg on its own venue outcome",
+                    "Hedge %s DIVERGENCE after wait pf_up=%s pm_up=%s — "
+                    "TRUSTING PM (Chainlink) for both legs",
                     hedge.id, pf_up_won, pm_up_won,
                 )
+                pf_up_won = pm_up_won
             logger.info(
                 "Hedge %s resolution final pf_up=%s pm_up=%s (slug=%s t+%.0fs)",
                 hedge.id, pf_up_won, pm_up_won, slug, wait_s,
