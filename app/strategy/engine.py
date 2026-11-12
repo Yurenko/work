@@ -549,8 +549,8 @@ class HedgeEngine:
                 break
             await _asyncio.sleep(0.7)
 
-        # After wait: if PM still resting (GTC unfilled), cancel so we don't leave
-        # orphan order; manage_partial can re-place at updated ask.
+        # After wait: if PM still resting, cancel — but then re-check for partial fill
+        # (cancel races with match; first GTC may still fill shares).
         if pm_fill.status == "SUBMITTED" and pm_fill.order_id:
             try:
                 st = await self.pm.get_order(pm_fill.order_id)
@@ -558,20 +558,54 @@ class HedgeEngine:
                     got = fill_from_pm_order(st, target_net)
                     if got.status == "FILLED" and got.shares > 0.5:
                         pm_fill = got
-            except Exception:
-                pass
+                        logger.info(
+                            "PM GTC filled at end of wait %.4f@%.4f",
+                            got.shares, got.price or 0,
+                        )
+            except Exception as e:
+                logger.debug("PM get_order end-wait: %s", e)
             if pm_fill.status != "FILLED":
                 try:
                     await self.pm.cancel_order(pm_fill.order_id)
-                    logger.info("PM GTC cancel after wait (unfilled) id=%s", pm_fill.order_id[:18])
+                    logger.info("PM GTC cancel after wait id=%s", str(pm_fill.order_id)[:18])
                 except Exception as e:
                     logger.debug("PM cancel after wait: %s", e)
-                pm_fill = Fill(
-                    status="REJECTED",
-                    reason="GTC unfilled after wait",
-                    order_id=pm_fill.order_id,
-                    price=pm_fill.price,
-                )
+                # Race: fill may complete during cancel — poll once more
+                await _asyncio.sleep(0.8)
+                try:
+                    st = await self.pm.get_order(pm_fill.order_id)
+                    if st:
+                        got = fill_from_pm_order(st, target_net)
+                        if got.status == "FILLED" and got.shares > 0.5:
+                            pm_fill = got
+                            logger.info(
+                                "PM GTC filled after cancel race %.4f@%.4f",
+                                got.shares, got.price or 0,
+                            )
+                except Exception:
+                    pass
+                if pm_fill.status != "FILLED":
+                    # Also try token balance as last resort
+                    try:
+                        bal = await self.pm.get_token_balance(str(pm_token))
+                        if bal >= target_net * 0.5:
+                            pm_fill = Fill(
+                                status="FILLED",
+                                shares=min(bal, target_net * 1.08),
+                                price=float(pm_ask) or 0.5,
+                                usd=min(bal, target_net) * float(pm_ask or 0.5),
+                                order_id=pm_fill.order_id,
+                            )
+                            logger.info("PM fill from token balance %.4f", bal)
+                    except Exception:
+                        pass
+                if pm_fill.status != "FILLED":
+                    pm_fill = Fill(
+                        status="REJECTED",
+                        reason="GTC unfilled after wait",
+                        order_id=pm_fill.order_id,
+                        price=pm_fill.price,
+                    )
 
         # Cap PF shares to target (positions API can return total market size)
         if pf_fill.status == "FILLED" and pf_fill.shares > target_net * 1.05:
@@ -1085,54 +1119,85 @@ class HedgeEngine:
                     )
                     logger.info("PF retry: adopting partial live %.4f (no more buys)", live_sh)
 
-        # --- PM leg: only if PF is filled and PM empty ---
+        # --- PM leg: only if PF is filled and PM empty / short ---
         if hedge.pm_leg.status != "FILLED" and hedge.pf_leg.status == "FILLED":
-            if (hedge.pm_leg.filled_shares or 0) > 0.5:
-                logger.info("PM already has %.2f filled — skip retry buy", hedge.pm_leg.filled_shares)
+            already = float(hedge.pm_leg.filled_shares or 0)
+            need_total = float(hedge.pf_leg.filled_shares or hedge.pf_leg.requested_shares or 0)
+            # Live token balance may show fills the order API missed
+            try:
+                bal = await self.pm.get_token_balance(str(hedge.pm_leg.token_or_market))
+                if bal > already:
+                    already = bal
+            except Exception:
+                pass
+            if already >= max(0.5, need_total * 0.85):
+                px = float(hedge.pm_leg.entry_price or 0) or 0.5
+                self._apply_fill(
+                    hedge.pm_leg,
+                    Fill(
+                        status="FILLED",
+                        shares=round(min(already, need_total * 1.08), 4),
+                        price=round(px, 4),
+                        usd=round(min(already, need_total) * px, 4),
+                        order_id=hedge.pm_leg.order_id,
+                    ),
+                )
+                logger.info(
+                    "PM retry: already have %.2f shares (need %.2f) — no new order",
+                    already, need_total,
+                )
+            elif getattr(hedge, "_pm_extra_buys", 0) >= 1:
+                logger.warning(
+                    "PM retry: already placed 1 extra buy, have=%.2f need=%.2f — stop",
+                    already, need_total,
+                )
             else:
                 _, ask = self._pm_best(hedge.pm_leg.direction)
-                size = float(hedge.pf_leg.filled_shares or hedge.pf_leg.requested_shares or 0)
-                if ask and size > 0:
-                    # Do NOT chase a much worse PM price after PF already filled.
+                shortfall = max(0.0, need_total - already)
+                if ask and shortfall >= 0.5:
                     pf_px = float(hedge.pf_leg.entry_price or 0)
                     projected = pf_px + float(ask)
-                    max_ok = float(self.settings.entry_sum_max) + 0.05  # 5¢ slack for GTC fill
+                    max_ok = float(self.settings.entry_sum_max) + 0.05
                     if pf_px > 0 and projected > max_ok:
                         logger.warning(
                             "Hedge %s ABORT PM retry: projected entry_sum=%.3f "
-                            "(pf@%.3f + pm_ask@%.3f) > max %.3f — UNWIND PF (naked risk)",
+                            "(pf@%.3f + pm_ask@%.3f) > max %.3f — UNWIND PF",
                             hedge.id, projected, pf_px, float(ask), max_ok,
                         )
                         hedge.pm_leg.status = "REJECTED"
                         hedge.pm_leg.reject_reason = (
                             f"retry ask too high ({projected:.3f} > {max_ok:.3f})"
                         )
-                        # Critical: do NOT leave PF naked. Market-sell PF to close.
                         try:
                             await self._unwind_pf_leg(hedge)
                         except Exception as e:
                             logger.error("PF unwind after PM abort failed: %s", e)
                         return
-                    # Cancel any previous resting PM order before new one
-                    if hedge.pm_leg.order_id and hedge.pm_leg.status in ("SUBMITTED", "REJECTED"):
+                    # Cancel previous resting order only
+                    if hedge.pm_leg.order_id:
                         try:
                             await self.pm.cancel_order(hedge.pm_leg.order_id)
                             logger.info("PM cancel before retry %s", str(hedge.pm_leg.order_id)[:18])
                         except Exception as e:
                             logger.debug("PM cancel before retry: %s", e)
-                    # Place GTC at current ask; wait briefly for fill
-                    resp = await self.pm.place_market_buy(
-                        hedge.pm_leg.token_or_market, size, float(ask),
+                    # Buy ONLY the shortfall, not full size again
+                    logger.info(
+                        "PM retry BUY shortfall=%.4f (have=%.4f need=%.4f) @ ask=%.3f",
+                        shortfall, already, need_total, float(ask),
                     )
-                    fill = fill_from_pm_order(resp, size)
+                    resp = await self.pm.place_market_buy(
+                        hedge.pm_leg.token_or_market, shortfall, float(ask),
+                    )
+                    hedge._pm_extra_buys = getattr(hedge, "_pm_extra_buys", 0) + 1
+                    fill = fill_from_pm_order(resp, shortfall)
                     if fill.status == "SUBMITTED" and fill.order_id:
                         import asyncio as _aio
-                        for _ in range(8):  # ~5.6s
+                        for _ in range(8):
                             await _aio.sleep(0.7)
                             try:
                                 st = await self.pm.get_order(fill.order_id)
                                 if st:
-                                    got = fill_from_pm_order(st, size)
+                                    got = fill_from_pm_order(st, shortfall)
                                     if got.status == "FILLED" and got.shares > 0.5:
                                         fill = got
                                         break
@@ -1147,24 +1212,43 @@ class HedgeEngine:
                                 )
                             except Exception:
                                 pass
-                            fill = Fill(
-                                status="REJECTED",
-                                reason="GTC unfilled on retry",
-                                order_id=fill.order_id,
-                                price=fill.price,
-                            )
+                            # post-cancel race check
+                            await _aio.sleep(0.5)
+                            try:
+                                st = await self.pm.get_order(fill.order_id)
+                                if st:
+                                    got = fill_from_pm_order(st, shortfall)
+                                    if got.status == "FILLED" and got.shares > 0.5:
+                                        fill = got
+                            except Exception:
+                                pass
+                            if fill.status != "FILLED":
+                                fill = Fill(
+                                    status="REJECTED",
+                                    reason="GTC unfilled on retry",
+                                    order_id=fill.order_id,
+                                    price=fill.price,
+                                )
+                    if fill.status == "FILLED" and already > 0:
+                        # Combine prior + new
+                        tot = already + float(fill.shares)
+                        tot_usd = already * float(hedge.pm_leg.entry_price or fill.price or ask) + float(fill.usd or 0)
+                        avg = tot_usd / tot if tot else float(fill.price or ask)
+                        fill = Fill(
+                            status="FILLED",
+                            shares=round(min(tot, need_total * 1.08), 4),
+                            price=round(avg, 4),
+                            usd=round(tot_usd, 4),
+                            order_id=fill.order_id,
+                        )
                     self._apply_fill(hedge.pm_leg, fill)
-                    # If PM cannot meet $1 min without huge size imbalance → unwind PF
                     reason = (getattr(fill, "reason", None) or "") if fill else ""
                     if fill.status == "REJECTED" and (
                         "min-notional" in str(reason).lower()
                         or "min size" in str(reason).lower()
                         or "impossible" in str(reason).lower()
                     ):
-                        logger.warning(
-                            "Hedge %s PM min-notional reject — UNWIND PF",
-                            hedge.id,
-                        )
+                        logger.warning("Hedge %s PM min-notional reject — UNWIND PF", hedge.id)
                         try:
                             await self._unwind_pf_leg(hedge)
                         except Exception as e:

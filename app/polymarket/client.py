@@ -664,11 +664,102 @@ class PolymarketClient:
         return None
 
     async def get_order(self, order_id: str) -> Optional[dict]:
-        if not self.settings.is_live:
+        """Fetch order status; always return a plain dict (never str/object)."""
+        if not self.settings.is_live or not order_id:
             return None
         try:
             client = self._ensure_clob()
-            return client.get_order(order_id)
+            raw = client.get_order(order_id)
+            if raw is None:
+                return None
+            # Normalize: SDK may return dict, object, or occasionally a bare id string
+            if isinstance(raw, str):
+                logger.debug("PM get_order returned str: %s", raw[:40])
+                return {"orderID": order_id, "status": "LIVE", "id": raw}
+            if isinstance(raw, dict):
+                d = dict(raw)
+            else:
+                # pydantic / dataclass / simple namespace
+                d = {}
+                for k in (
+                    "orderID", "id", "status", "size_matched", "original_size",
+                    "price", "side", "takingAmount", "makingAmount", "filledShares",
+                    "associate_trades", "outcome", "asset_id",
+                ):
+                    if hasattr(raw, k):
+                        d[k] = getattr(raw, k)
+                if hasattr(raw, "dict") and callable(raw.dict):
+                    try:
+                        d = {**raw.dict(), **d}
+                    except Exception:
+                        pass
+                if hasattr(raw, "model_dump") and callable(raw.model_dump):
+                    try:
+                        d = {**raw.model_dump(), **d}
+                    except Exception:
+                        pass
+            if not d.get("orderID") and not d.get("id"):
+                d["orderID"] = order_id
+            # Promote size_matched → filledShares for our parser
+            sm = d.get("size_matched") or d.get("sizeMatched")
+            if sm is not None and not d.get("filledShares") and not d.get("takingAmount"):
+                try:
+                    d["filledShares"] = float(sm)
+                    d["takingAmount"] = float(sm)
+                except (TypeError, ValueError):
+                    pass
+            st = str(d.get("status") or "").lower()
+            if st in ("matched", "filled") or float(d.get("filledShares") or d.get("takingAmount") or 0) > 0.01:
+                d["status"] = "FILLED"
+            elif st in ("live", "open", "resting", ""):
+                d["status"] = "SUBMITTED"
+            elif st in ("cancelled", "canceled", "expired"):
+                # may still have partial fill
+                if float(d.get("filledShares") or d.get("takingAmount") or 0) > 0.01:
+                    d["status"] = "FILLED"
+                else:
+                    d["status"] = "REJECTED"
+            return d
         except Exception as e:
             self.last_error = str(e)
+            logger.debug("PM get_order(%s) failed: %s", str(order_id)[:18], e)
             return None
+
+    async def get_token_balance(self, token_id: str) -> float:
+        """Conditional token balance (shares held) if SDK supports it."""
+        if not self.settings.is_live or not token_id:
+            return 0.0
+        try:
+            client = self._ensure_clob()
+            # Try common method names across py_clob versions
+            for name in ("get_balance", "getBalance", "get_conditional_balance"):
+                fn = getattr(client, name, None)
+                if not fn:
+                    continue
+                try:
+                    r = fn(token_id)
+                except TypeError:
+                    try:
+                        r = fn(token_id=token_id)
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+                if r is None:
+                    continue
+                if isinstance(r, (int, float, str)):
+                    v = float(r)
+                    if v > 1e6:
+                        v = v / 1e6
+                    return max(0.0, v)
+                if isinstance(r, dict):
+                    for k in ("balance", "size", "shares", "available"):
+                        if r.get(k) is not None:
+                            v = float(r[k])
+                            if v > 1e6:
+                                v = v / 1e6
+                            return max(0.0, v)
+            return 0.0
+        except Exception as e:
+            logger.debug("PM get_token_balance: %s", e)
+            return 0.0
