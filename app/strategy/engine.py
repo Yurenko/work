@@ -1357,11 +1357,12 @@ class HedgeEngine:
                     "%s sell filled via position-drop sold=%.4f @%.4f proceeds=$%.4f left=%.4f",
                     label, sold, leg.exit_price, proceeds, after,
                 )
+                # Keep entry filled_shares for cost basis; residual handled next loop / dust
                 if after <= 0.05 or after * (bid or 0.5) < 0.50:
                     leg.status = "CLOSED"
                 else:
-                    # residual still sellable — leave open for retry with smaller size
-                    leg.filled_shares = after
+                    # leave status open so residual can be sold, but do NOT shrink filled_shares
+                    pass
                 return True
 
             if fill.status == "FILLED":
@@ -1429,9 +1430,8 @@ class HedgeEngine:
                             label, leg.exit_price, leg.exit_usd,
                         )
                     else:
-                        leg.filled_shares = max(0.0, int(live2 * 0.95 * 10000) / 10000.0)
                         logger.info(
-                            "%s sell: insufficient — live=%.4f shrink tracked to %.4f",
+                            "%s sell: insufficient — live=%.4f (keeping entry shares %.4f)",
                             label, live2, leg.filled_shares,
                         )
             return
@@ -1498,17 +1498,46 @@ class HedgeEngine:
                 return
 
         if hedge.pf_leg.status == "CLOSED" and hedge.pm_leg.status == "CLOSED":
+            # Re-pull PF SELL proceeds from activity — residual-dust close often
+            # left exit_usd at ~$0.1 while we actually sold most of the position.
+            if (hedge.close_reason or "") == "EXIT" and hedge.pf_leg.venue in ("predict", "pf", "bn"):
+                try:
+                    mid = hedge.pf_leg.token_or_market
+                    act = await self.pf.get_fill_price_from_activity(
+                        mid, order_id="", limit_price=0.0, for_sell=True,
+                    )
+                    if act and float(act.get("cost_usd") or 0) > 0.5:
+                        sold_usd = float(act["cost_usd"])
+                        sold_sh = float(act.get("shares") or 0)
+                        if sold_usd > float(hedge.pf_leg.exit_usd or 0) + 0.05:
+                            old_u = float(hedge.pf_leg.exit_usd or 0)
+                            hedge.pf_leg.exit_usd = sold_usd
+                            if sold_sh > 0:
+                                hedge.pf_leg.exit_price = round(sold_usd / sold_sh, 4)
+                            # Restore display size to what we actually sold (not residual)
+                            if sold_sh > float(hedge.pf_leg.filled_shares or 0):
+                                hedge.pf_leg.filled_shares = sold_sh
+                            logger.info(
+                                "PF EXIT activity reconcile proceeds $%.4f → $%.4f @%.4f sh=%.4f",
+                                old_u, sold_usd, hedge.pf_leg.exit_price, sold_sh,
+                            )
+                except Exception as e:
+                    logger.warning("PF EXIT activity reconcile failed: %s", e)
+
             def _leg_pnl_exit(leg: Leg) -> float:
-                sh = float(leg.filled_shares or 0)
-                if sh <= 0:
-                    return 0.0
-                cost = float(leg.entry_usd or 0) or float(leg.entry_price or 0) * sh
-                proceeds = float(leg.exit_usd or 0) or float(leg.exit_price or 0) * sh
+                # Cost = entry_usd (fixed at open). Proceeds = exit_usd (from sell/activity).
+                # Never multiply residual filled_shares into cost — that understates loss/profit.
+                cost = float(leg.entry_usd or 0)
+                if cost <= 0 and leg.entry_price and (leg.filled_shares or 0) > 0:
+                    cost = float(leg.entry_price) * float(leg.filled_shares)
+                proceeds = float(leg.exit_usd or 0)
+                if proceeds <= 0 and leg.exit_price is not None and (leg.filled_shares or 0) > 0:
+                    proceeds = float(leg.exit_price) * float(leg.filled_shares)
                 return proceeds - cost
+
             pf_pnl = _leg_pnl_exit(hedge.pf_leg)
             pm_pnl = _leg_pnl_exit(hedge.pm_leg)
             hedge.pnl = pf_pnl + pm_pnl
-            # Binary market prices must stay in [0, 1]
             for leg in (hedge.pf_leg, hedge.pm_leg):
                 if leg.exit_price is not None:
                     leg.exit_price = min(1.0, max(0.0, float(leg.exit_price)))
