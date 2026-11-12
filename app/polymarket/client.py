@@ -595,25 +595,80 @@ class PolymarketClient:
             return {"status": "REJECTED", "reason": str(e)}
 
     async def cancel_order(self, order_id: str) -> bool:
-        """Cancel a resting CLOB order so retry does not double size."""
+        """Cancel a resting CLOB order. Returns True if cancel call succeeded
+        or order is already gone / filled. Never raises.
+        """
         if not order_id:
             return False
+        oid = str(order_id).strip()
         try:
             clob = self._ensure_clob()
             if clob is None:
                 return False
+            last_err = None
             for name in ("cancel", "cancel_order", "cancelOrder"):
+                fn = getattr(clob, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    res = fn(oid)
+                except TypeError:
+                    try:
+                        res = fn(order_id=oid)
+                    except Exception as e2:
+                        last_err = e2
+                        continue
+                except Exception as e1:
+                    # SDK sometimes throws weird errors on already-gone orders
+                    last_err = e1
+                    msg = str(e1).lower()
+                    if "not found" in msg or "already" in msg or "orderid" in msg:
+                        logger.info("PM cancel %s treated ok (%s)", oid[:18], e1)
+                        return True
+                    continue
+                # Success path — normalize result
+                try:
+                    logger.info("PM cancel %s → %s", oid[:18], res)
+                except Exception:
+                    logger.info("PM cancel %s → ok", oid[:18])
+                return True
+            if last_err:
+                logger.warning("PM cancel %s failed: %s", oid[:18], last_err)
+            else:
+                logger.warning("PM cancel: no cancel method on ClobClient")
+        except Exception as e:
+            logger.warning("PM cancel %s failed: %s", oid[:18], e)
+        # Verify: if get_order says gone/filled, treat as success
+        try:
+            st = await self.get_order(oid)
+            if st is None:
+                return True
+            status = str(st.get("status") or "").upper()
+            if status in ("REJECTED", "CANCELLED", "CANCELED", "FILLED", ""):
+                return True
+            if float(st.get("filledShares") or st.get("takingAmount") or 0) > 0.01:
+                return True  # partially/fully filled — no longer resting as open
+        except Exception:
+            pass
+        return False
+
+    async def cancel_all_orders(self) -> bool:
+        """Best-effort cancel all open CLOB orders (frees locked USDC)."""
+        try:
+            clob = self._ensure_clob()
+            if clob is None:
+                return False
+            for name in ("cancel_all", "cancelAll", "cancel_market_orders"):
                 fn = getattr(clob, name, None)
                 if callable(fn):
                     try:
-                        res = fn(order_id)
-                    except TypeError:
-                        res = fn(order_id=order_id)
-                    logger.info("PM cancel %s → %s", order_id[:18], res)
-                    return True
-            logger.warning("PM cancel: no cancel method on ClobClient")
+                        res = fn()
+                        logger.info("PM cancel_all → %s", res)
+                        return True
+                    except Exception as e:
+                        logger.warning("PM %s failed: %s", name, e)
         except Exception as e:
-            logger.warning("PM cancel %s failed: %s", order_id[:18], e)
+            logger.warning("PM cancel_all failed: %s", e)
         return False
 
     async def get_collateral_balance(self) -> float | None:
