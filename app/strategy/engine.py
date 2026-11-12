@@ -606,28 +606,114 @@ class HedgeEngine:
         if pm_fill.status == "FILLED" and pf_fill.status != "FILLED":
             await _asyncio.sleep(1.0)
             logger.info("PF limit retry after PM filled")
-            if pf_fill.order_id:
+            # CRITICAL: check live position BEFORE placing another order.
+            # First order may already have filled (GET /orders → 404) while we still
+            # think status != FILLED — placing again doubles shares (6→12).
+            live_sh = 0.0
+            live_avg = 0.0
+            live_usd = 0.0
+            try:
                 try:
-                    await self.pf.cancel_order(str(pf_fill.order_id))
-                    logger.info("PF cancel resting %s before retry", pf_fill.order_id)
-                except Exception as e:
-                    logger.warning("PF cancel before retry: %s", e)
-            pf_resp2 = await self.pf.place_order(
-                pf_m["id"], "BUY", order_shares, min(0.99, pf_px + 0.02),
-                is_yes=(pf_dir == "up"),
-            )
-            pf_fill2 = fill_from_predict(pf_resp2, order_shares)
-            if pf_fill2.status == "SUBMITTED" and pf_fill2.order_id:
-                await _asyncio.sleep(2.0)
-                try:
-                    st = await self.pf.get_order(pf_fill2.order_id)
-                    if st:
-                        pf_fill2 = fill_from_predict(st, order_shares)
-                except Exception:
-                    pass
-            if pf_fill2.status == "FILLED":
-                pf_fill = pf_fill2
+                    pos = await self.pf.get_position_for_market(pf_m["id"], is_yes=(pf_dir == "up"))
+                except TypeError:
+                    pos = await self.pf.get_position_for_market(pf_m["id"])
+                if pos:
+                    live_sh = float(pos.get("shares") or 0)
+                    live_avg = float(pos.get("avg_price") or 0)
+                    live_usd = float(pos.get("cost_usd") or 0) or (live_sh * live_avg)
+            except Exception as e:
+                logger.warning("PF live position check before retry: %s", e)
+
+            if live_sh >= max(0.5, order_shares * 0.85):
+                # Already filled — adopt live size, do NOT place another order
+                sh = min(live_sh, order_shares * 1.08)  # small overfill ok, not 2x
+                ap = live_avg if 0.01 <= live_avg <= 1 else float(pf_px)
+                cu = live_usd if live_usd > 0 else sh * ap
+                pf_fill = Fill(
+                    status="FILLED", shares=round(sh, 4),
+                    price=round(ap, 4), usd=round(cu, 4),
+                    order_id=pf_fill.order_id,
+                )
                 filled_pf = float(pf_fill.shares)
+                logger.info(
+                    "PF already filled on-chain %.4f@%.4f (skip retry buy)",
+                    sh, ap,
+                )
+            else:
+                # Cancel resting only if we still need more
+                if pf_fill.order_id:
+                    try:
+                        await self.pf.cancel_order(str(pf_fill.order_id))
+                        logger.info("PF cancel resting %s before retry", pf_fill.order_id)
+                    except Exception as e:
+                        logger.warning("PF cancel before retry: %s", e)
+                need_pf = max(0.0, order_shares - live_sh)
+                if need_pf < 0.5:
+                    sh = max(live_sh, 0.0)
+                    ap = live_avg if 0.01 <= live_avg <= 1 else float(pf_px)
+                    pf_fill = Fill(
+                        status="FILLED", shares=round(sh, 4),
+                        price=round(ap, 4), usd=round(sh * ap, 4),
+                        order_id=pf_fill.order_id,
+                    )
+                    filled_pf = float(pf_fill.shares)
+                    logger.info("PF near target from live %.4f — no new buy", sh)
+                else:
+                    px = round(min(0.99, float(pf_px) + 0.02), 2)  # max 2 decimals
+                    logger.info("PF retry buy need=%.4f @ %.2f (live had %.4f)", need_pf, px, live_sh)
+                    pf_resp2 = await self.pf.place_order(
+                        pf_m["id"], "BUY", need_pf, px,
+                        is_yes=(pf_dir == "up"),
+                    )
+                    pf_fill2 = fill_from_predict(pf_resp2, need_pf)
+                    if pf_fill2.status == "SUBMITTED" and pf_fill2.order_id:
+                        await _asyncio.sleep(2.0)
+                        try:
+                            st = await self.pf.get_order(pf_fill2.order_id)
+                            if st:
+                                pf_fill2 = fill_from_predict(st, need_pf)
+                        except Exception:
+                            pass
+                        # position check if still not marked filled
+                        if pf_fill2.status != "FILLED":
+                            try:
+                                try:
+                                    pos2 = await self.pf.get_position_for_market(
+                                        pf_m["id"], is_yes=(pf_dir == "up")
+                                    )
+                                except TypeError:
+                                    pos2 = await self.pf.get_position_for_market(pf_m["id"])
+                                if pos2 and float(pos2.get("shares") or 0) >= max(0.5, order_shares * 0.85):
+                                    sh = min(float(pos2["shares"]), order_shares * 1.08)
+                                    ap = float(pos2.get("avg_price") or px)
+                                    cu = float(pos2.get("cost_usd") or 0) or sh * ap
+                                    pf_fill2 = Fill(
+                                        status="FILLED", shares=round(sh, 4),
+                                        price=round(ap if 0.01 <= ap <= 1 else px, 4),
+                                        usd=round(cu, 4), order_id=pf_fill2.order_id,
+                                    )
+                            except Exception:
+                                pass
+                    if pf_fill2.status == "FILLED":
+                        # If we already had some live shares, combine
+                        if live_sh > 0.1:
+                            tot = live_sh + float(pf_fill2.shares)
+                            # Cap at ~target*1.08 — should not happen if need_pf was correct
+                            if tot > order_shares * 1.15:
+                                logger.warning(
+                                    "PF combined %.4f exceeds target — using live+fill carefully",
+                                    tot,
+                                )
+                            tot_usd = live_usd + float(pf_fill2.usd or 0)
+                            avg = tot_usd / tot if tot else float(pf_fill2.price or 0)
+                            pf_fill = Fill(
+                                status="FILLED", shares=round(min(tot, order_shares * 1.08), 4),
+                                price=round(avg, 4), usd=round(tot_usd, 4),
+                                order_id=pf_fill2.order_id or pf_fill.order_id,
+                            )
+                        else:
+                            pf_fill = pf_fill2
+                        filled_pf = float(pf_fill.shares)
 
         # Cancel any leftover PM resting order
         if pm_fill.status == "SUBMITTED" and pm_fill.order_id:
@@ -778,36 +864,47 @@ class HedgeEngine:
             is_yes = hedge.pf_leg.direction == "up"
             mid = hedge.pf_leg.token_or_market
             need = float(hedge.pf_leg.requested_shares or 0)
+            live_sh = 0.0
+            live_avg = 0.0
+            live_usd = 0.0
             # 1) Live position first (order GET often 404 after fill)
             try:
                 try:
                     pos = await self.pf.get_position_for_market(mid, is_yes=is_yes)
                 except TypeError:
                     pos = await self.pf.get_position_for_market(mid)
-                if pos and float(pos.get("shares") or 0) >= max(0.5, need * 0.5):
-                    sh = float(pos["shares"])
-                    # Cap to this hedge's requested size (other fills may exist)
-                    sh = min(sh, need * 1.05) if need > 0 else sh
-                    ap = float(pos.get("avg_price") or 0)
-                    cu = float(pos.get("cost_usd") or 0) or (sh * ap if ap else 0)
-                    if cu > 0 and sh > 0 and (cu / sh) > 1.5 and cu > 50:
-                        cu = cu / 100.0
-                    px = (cu / sh) if (cu > 0 and sh > 0) else (ap or 0)
-                    if 0.01 <= px <= 1.0:
-                        self._apply_fill(
-                            hedge.pf_leg,
-                            Fill(status="FILLED", shares=round(sh, 4), price=round(px, 4),
-                                 usd=round(cu or sh * px, 4), order_id=hedge.pf_leg.order_id),
-                        )
-                        logger.info(
-                            "PF retry: position shows FILLED %.4f@%.4f (no new order)",
-                            sh, px,
-                        )
+                if pos:
+                    live_sh = float(pos.get("shares") or 0)
+                    live_avg = float(pos.get("avg_price") or 0)
+                    live_usd = float(pos.get("cost_usd") or 0) or (live_sh * live_avg if live_avg else 0)
+                    if live_usd > 0 and live_sh > 0 and (live_usd / live_sh) > 1.5 and live_usd > 50:
+                        live_usd = live_usd / 100.0
             except Exception as e:
                 logger.debug("PF position check on retry: %s", e)
 
-            # 2) Still not filled → cancel any resting order, then place ONE new buy
-            if hedge.pf_leg.status != "FILLED":
+            if live_sh >= max(0.5, need * 0.85):
+                # Enough shares already — NEVER buy more (prevents 6→12)
+                sh = min(live_sh, need * 1.08) if need > 0 else live_sh
+                px = (live_usd / live_sh) if (live_usd > 0 and live_sh > 0) else live_avg
+                if not (0.01 <= px <= 1.0):
+                    px = live_avg if 0.01 <= live_avg <= 1 else 0.5
+                self._apply_fill(
+                    hedge.pf_leg,
+                    Fill(status="FILLED", shares=round(sh, 4), price=round(px, 4),
+                         usd=round(live_usd or sh * px, 4), order_id=hedge.pf_leg.order_id),
+                )
+                logger.info(
+                    "PF retry: position shows FILLED %.4f@%.4f live=%.4f (no new order)",
+                    sh, px, live_sh,
+                )
+            elif getattr(hedge, "_pf_extra_buys", 0) >= 1:
+                # Already placed one extra buy this hedge — stop spamming
+                logger.warning(
+                    "PF retry: already did 1 extra buy, live=%.4f need=%.4f — waiting",
+                    live_sh, need,
+                )
+            else:
+                # Cancel resting, buy ONLY the shortfall
                 if hedge.pf_leg.order_id:
                     try:
                         await self.pf.cancel_order(str(hedge.pf_leg.order_id))
@@ -815,39 +912,65 @@ class HedgeEngine:
                     except Exception as e:
                         logger.warning("PF cancel before retry: %s", e)
                     hedge.pf_leg.order_id = ""
-                    hedge.pf_leg.status = "REJECTED"  # cleared resting
 
+                shortfall = max(0.0, need - live_sh)
                 _, ask = self._pf_best(mid, hedge.pf_leg.direction)
-                if ask and need > 0:
-                    # Only one replacement order; aggressive limit
-                    px = min(0.99, round(float(ask) + 0.02, 2))
-                    logger.info("PF retry BUY once size=%.4f @ %.2f (after cancel)", need, px)
-                    resp = await self.pf.place_order(
-                        mid, "BUY", need, px, is_yes=is_yes,
+                if ask and shortfall >= 0.5:
+                    px = min(0.99, round(float(ask) + 0.02, 2))  # 2 decimals max
+                    logger.info(
+                        "PF retry BUY shortfall=%.4f (live=%.4f need=%.4f) @ %.2f",
+                        shortfall, live_sh, need, px,
                     )
-                    fill = fill_from_predict(resp, need)
-                    self._apply_fill(hedge.pf_leg, fill)
-                    # If SUBMITTED, wait briefly and check position — do NOT place another
-                    if fill.status == "SUBMITTED":
-                        import asyncio as _aio
-                        await _aio.sleep(1.5)
-                        try:
+                    resp = await self.pf.place_order(
+                        mid, "BUY", shortfall, px, is_yes=is_yes,
+                    )
+                    hedge._pf_extra_buys = getattr(hedge, "_pf_extra_buys", 0) + 1
+                    fill = fill_from_predict(resp, shortfall)
+                    if fill.status == "FILLED":
+                        # Combine with any live shares
+                        tot_sh = live_sh + float(fill.shares)
+                        tot_usd = live_usd + float(fill.usd or 0)
+                        avg = (tot_usd / tot_sh) if tot_sh else float(fill.price or px)
+                        self._apply_fill(
+                            hedge.pf_leg,
+                            Fill(status="FILLED",
+                                 shares=round(min(tot_sh, need * 1.08), 4),
+                                 price=round(avg, 4),
+                                 usd=round(tot_usd, 4),
+                                 order_id=fill.order_id),
+                        )
+                    else:
+                        self._apply_fill(hedge.pf_leg, fill)
+                        if fill.status == "SUBMITTED":
+                            import asyncio as _aio
+                            await _aio.sleep(1.5)
                             try:
-                                pos = await self.pf.get_position_for_market(mid, is_yes=is_yes)
-                            except TypeError:
-                                pos = await self.pf.get_position_for_market(mid)
-                            if pos and float(pos.get("shares") or 0) >= max(0.5, need * 0.5):
-                                sh = min(float(pos["shares"]), need * 1.05)
-                                ap = float(pos.get("avg_price") or px)
-                                cu = float(pos.get("cost_usd") or 0) or sh * ap
-                                self._apply_fill(
-                                    hedge.pf_leg,
-                                    Fill(status="FILLED", shares=round(sh, 4),
-                                         price=round(ap if 0.01 <= ap <= 1 else px, 4),
-                                         usd=round(cu, 4), order_id=fill.order_id),
-                                )
-                        except Exception:
-                            pass
+                                try:
+                                    pos = await self.pf.get_position_for_market(mid, is_yes=is_yes)
+                                except TypeError:
+                                    pos = await self.pf.get_position_for_market(mid)
+                                if pos and float(pos.get("shares") or 0) >= max(0.5, need * 0.85):
+                                    sh = min(float(pos["shares"]), need * 1.08)
+                                    ap = float(pos.get("avg_price") or px)
+                                    cu = float(pos.get("cost_usd") or 0) or sh * ap
+                                    self._apply_fill(
+                                        hedge.pf_leg,
+                                        Fill(status="FILLED", shares=round(sh, 4),
+                                             price=round(ap if 0.01 <= ap <= 1 else px, 4),
+                                             usd=round(cu, 4), order_id=fill.order_id),
+                                    )
+                            except Exception:
+                                pass
+                elif live_sh >= 0.5:
+                    # Have something but below threshold and no ask — mark what we have
+                    px = live_avg if 0.01 <= live_avg <= 1 else 0.5
+                    self._apply_fill(
+                        hedge.pf_leg,
+                        Fill(status="FILLED", shares=round(live_sh, 4), price=round(px, 4),
+                             usd=round(live_usd or live_sh * px, 4),
+                             order_id=hedge.pf_leg.order_id),
+                    )
+                    logger.info("PF retry: adopting partial live %.4f (no more buys)", live_sh)
 
         # --- PM leg: only if PF is filled and PM empty ---
         if hedge.pm_leg.status != "FILLED" and hedge.pf_leg.status == "FILLED":

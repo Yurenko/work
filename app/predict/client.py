@@ -753,6 +753,7 @@ class PredictClient:
         In PAPER mode returns a simulated FILLED response.
         Live mode requires JWT + signed order body (via SDK when available).
         """
+        price = round(float(price), 2)  # Predict max 2 decimal places
         side = side.upper()
         shares = float(shares)
         price = round(float(price), 4)
