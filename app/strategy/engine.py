@@ -357,18 +357,28 @@ class HedgeEngine:
         pm_dn_bid, pm_dn_ask = self._pm_best("down")
 
         candidates: list[tuple[float, str, str]] = []
-        # opposite pairs only
-        if pf_up_ask and pm_dn_ask:
-            s = pf_up_ask + pm_dn_ask
+        # opposite pairs only — reject extreme legs (thin books / near-resolution)
+        # PM ask < 0.05 or PF ask > 0.95 → min-notional or near-certain outcome, skip
+        def _leg_ok(pf_a: float, pm_a: float) -> bool:
+            if pf_a is None or pm_a is None:
+                return False
+            if pm_a < 0.05 or pm_a > 0.95:
+                return False
+            if pf_a < 0.05 or pf_a > 0.95:
+                return False
+            return True
+
+        if pf_up_ask and pm_dn_ask and _leg_ok(float(pf_up_ask), float(pm_dn_ask)):
+            s = float(pf_up_ask) + float(pm_dn_ask)
             if s < self.settings.entry_sum_max:
                 candidates.append((s, "up", "down"))
-        if pf_dn_ask and pm_up_ask:
-            s = pf_dn_ask + pm_up_ask
+        if pf_dn_ask and pm_up_ask and _leg_ok(float(pf_dn_ask), float(pm_up_ask)):
+            s = float(pf_dn_ask) + float(pm_up_ask)
             if s < self.settings.entry_sum_max:
                 candidates.append((s, "down", "up"))
 
         if not candidates:
-            self.status_text = "no entry sum < threshold"
+            self.status_text = "no entry sum < threshold (or extreme prices)"
             return
         candidates.sort(key=lambda x: x[0])
         entry_sum, pf_dir, pm_dir = candidates[0]
@@ -457,6 +467,30 @@ class HedgeEngine:
             "LIMIT ENTRY simultaneous target_net=%.2f PF order=%.4f @ %.2f | PM size=%.4f @ %.2f",
             target_net, order_shares, pf_px, target_net, pm_px,
         )
+
+        # CRITICAL: if PM cannot take target size at this ask (CLOB $1 min-notional),
+        # do NOT place PF either — parallel gather used to buy PF naked → -$10 phantom.
+        pm_notional = float(pm_px) * float(target_net)
+        if pm_notional < 1.0:
+            need_sh = 1.05 / max(float(pm_px), 0.001)
+            if need_sh > target_net * 1.15:
+                logger.warning(
+                    "SKIP ENTRY: PM ask=%.3f needs ~%.0f sh for $1 min (target=%.1f) — "
+                    "refuse both legs",
+                    pm_px, need_sh, target_net,
+                )
+                hedge.status = "CLOSED"
+                hedge.closed_at = time.time()
+                hedge.pnl = 0.0
+                if hedge in self.hedges:
+                    try:
+                        self.hedges.remove(hedge)
+                    except ValueError:
+                        pass
+                self._entry_busy = False
+                self.pf_entry_cooldown_until = time.time() + 8.0
+                self.status_text = "pm min-notional impossible — skip"
+                return
 
         # Pre-check: if this market already has our side filled (stale leftover or
         # prior partial), do NOT place another full size buy.
@@ -1930,42 +1964,91 @@ class HedgeEngine:
             logger.debug("UNWIND cancel_all: %s", e)
 
         await self._sell_leg(hedge.pf_leg, "PF")
-        # Wait briefly for sell fill / activity proceeds
+        # Wait for sell fill / activity proceeds — PF sells often fill after 2–8s
+        import asyncio as _aio
         if float(hedge.pf_leg.exit_usd or 0) <= 0.01:
-            import asyncio as _aio
-            for _ in range(6):
-                await _aio.sleep(0.8)
+            for _ in range(12):
+                await _aio.sleep(1.0)
                 if float(hedge.pf_leg.exit_usd or 0) > 0.01:
                     break
                 try:
                     act = await self.pf.get_fill_price_from_activity(
                         hedge.pf_leg.token_or_market,
-                        order_id=str(hedge.pf_leg.order_id or ""),
+                        order_id="",
                         limit_price=0.0,
                         for_sell=True,
                     )
-                    if act and float(act.get("cost_usd") or 0) > 0:
+                    if act and float(act.get("cost_usd") or 0) > 0.5:
                         hedge.pf_leg.exit_usd = float(act["cost_usd"])
-                        hedge.pf_leg.exit_price = float(act.get("avg_price") or 0)
+                        ash = float(act.get("shares") or 0) or float(hedge.pf_leg.filled_shares or 0)
+                        if ash > 0:
+                            hedge.pf_leg.exit_price = round(
+                                float(act.get("avg_price") or (hedge.pf_leg.exit_usd / ash)), 4
+                            )
                         hedge.pf_leg.status = "CLOSED"
+                        logger.info(
+                            "UNWIND PF activity sell $%.4f @%.4f sh=%.4f",
+                            hedge.pf_leg.exit_usd, hedge.pf_leg.exit_price or 0, ash,
+                        )
+                        break
+                except Exception:
+                    pass
+                # Also check position went to ~0 → sell filled at bid estimate
+                try:
+                    pos = await self.pf.get_position_for_market(
+                        hedge.pf_leg.token_or_market,
+                        is_yes=(hedge.pf_leg.direction == "up"),
+                    )
+                    live = float((pos or {}).get("shares") or 0)
+                    if live < 0.5 and float(hedge.pf_leg.filled_shares or 0) >= 0.5:
+                        bid, _ = self._pf_best(
+                            hedge.pf_leg.token_or_market, hedge.pf_leg.direction,
+                        )
+                        px = float(bid or hedge.pf_leg.entry_price or 0.5)
+                        sh = float(hedge.pf_leg.filled_shares or 0)
+                        hedge.pf_leg.exit_price = px
+                        hedge.pf_leg.exit_usd = round(sh * px, 4)
+                        hedge.pf_leg.status = "CLOSED"
+                        logger.info(
+                            "UNWIND PF position flat → estimate exit $%.4f @%.4f",
+                            hedge.pf_leg.exit_usd, px,
+                        )
                         break
                 except Exception:
                     pass
 
         pf_cost = float(hedge.pf_leg.entry_usd or 0)
         pf_exit = float(hedge.pf_leg.exit_usd or 0)
+        # If still no exit after waits, use entry price as conservative estimate
+        # (not zero — zero made phantom -$10 losses and inflated recovery)
+        if pf_exit <= 0.01 and pf_cost > 0.01:
+            bid, _ = self._pf_best(hedge.pf_leg.token_or_market, hedge.pf_leg.direction)
+            px = float(bid or hedge.pf_leg.entry_price or 0)
+            if px > 0:
+                sh = float(hedge.pf_leg.filled_shares or 0)
+                pf_exit = round(sh * px, 4)
+                hedge.pf_leg.exit_usd = pf_exit
+                hedge.pf_leg.exit_price = px
+                logger.warning(
+                    "UNWIND PF exit still 0 — fallback bid estimate $%.4f @%.4f",
+                    pf_exit, px,
+                )
         pnl = pf_exit - pf_cost
         hedge.pnl = round(pnl, 4)
         hedge.status = "CLOSED"
         hedge.exit_sum = float(hedge.pf_leg.exit_price or 0)
         logger.info(
-            "Hedge %s UNWIND CLOSED pf_pnl=%.4f (exit=%.4f cost=%.4f) — recovery will size up",
+            "Hedge %s UNWIND CLOSED pf_pnl=%.4f (exit=$%.4f cost=$%.4f) — recovery will size up",
             hedge.id, pnl, pf_exit, pf_cost,
         )
         try:
-            self.recovery.on_pair_closed(
-                hedge.id, pnl, 0.0, 0.0, hedge.pf_leg.filled_shares or 0,
-            )
+            # Only count recovery if real economic loss (not phantom exit=0)
+            if abs(pnl) > 0.05 or pf_exit > 0.01:
+                self.recovery.on_pair_closed(
+                    hedge.id, pnl, 0.0, 0.0, hedge.pf_leg.filled_shares or 0,
+                )
+            else:
+                logger.warning("UNWIND skip recovery update (no real exit data)")
         except Exception as e:
             logger.warning("recovery on unwind: %s", e)
 
