@@ -493,12 +493,13 @@ class HedgeEngine:
         async def _pm_buy(size: float, px: float):
             return await self.pm.place_market_buy(str(pm_token), size, px)
 
-        pf_resp, pm_resp = await _asyncio.gather(_pf_buy(), _pm_buy(target_net, float(pm_ask)))
+        # Use pm_px (ask+1¢) so GTC is more likely to match immediately
+        pf_resp, pm_resp = await _asyncio.gather(_pf_buy(), _pm_buy(target_net, float(pm_px)))
         pf_fill = fill_from_predict(pf_resp, order_shares)
         pm_fill = fill_from_pm_order(pm_resp, target_net)
 
-        # Wait for SUBMITTED → FILLED. PM is now GTC resting — poll, do NOT cancel early.
-        wait_deadline = time.time() + 7.0
+        # Wait for SUBMITTED → FILLED. Longer window so GTC can match.
+        wait_deadline = time.time() + 15.0
         while time.time() < wait_deadline:
             need_wait = False
             if pf_fill.status == "SUBMITTED" and pf_fill.order_id:
@@ -618,6 +619,24 @@ class HedgeEngine:
                     except Exception:
                         pass
                 if pm_fill.status not in ("FILLED", "SUBMITTED"):
+                    # Must really kill the resting GTC so it cannot fill later
+                    try:
+                        ok = await self.pm.cancel_order(pm_fill.order_id)
+                        if not ok:
+                            await self.pm.cancel_all_orders()
+                        else:
+                            # belt-and-suspenders: clear any sibling GTCs from retries
+                            await self.pm.cancel_all_orders()
+                        logger.info(
+                            "PM force-clear after REJECTED id=%s cancel_ok=%s",
+                            str(pm_fill.order_id)[:18], ok,
+                        )
+                    except Exception as e:
+                        logger.warning("PM force-clear after REJECTED: %s", e)
+                        try:
+                            await self.pm.cancel_all_orders()
+                        except Exception:
+                            pass
                     pm_fill = Fill(
                         status="REJECTED",
                         reason="GTC unfilled after wait",
@@ -970,6 +989,14 @@ class HedgeEngine:
             reason = (pf_fill.reason or "").lower()
             self._entry_busy = False
             logger.warning("PF reject %s — abort pair", pf_fill.reason)
+            # Critical: kill any PM GTC that may still be resting
+            try:
+                if pm_fill.order_id:
+                    await self.pm.cancel_order(pm_fill.order_id)
+                await self.pm.cancel_all_orders()
+                logger.info("PM cleared after PF reject")
+            except Exception as e:
+                logger.warning("PM clear after PF reject: %s", e)
             if "jurisdiction" in reason or "403" in reason or "forbidden" in reason:
                 self.pf_entry_cooldown_until = time.time() + 3600.0
                 self.last_error = "Predict 403: not available in your jurisdiction"
@@ -1262,20 +1289,44 @@ class HedgeEngine:
                     pf_px = float(hedge.pf_leg.entry_price or 0)
                     projected = pf_px + float(ask)
                     max_ok = float(self.settings.entry_sum_max) + 0.05
+                    # Time left in window — only force-unwind near the end
+                    ends_in = 999.0
+                    try:
+                        ends_in = float(
+                            (getattr(self, "pf_state", None) or {}).get("live_end_in")
+                            or (getattr(self, "pm_state", None) or {}).get("ends_in")
+                            or 999
+                        )
+                    except Exception:
+                        ends_in = 999.0
                     if pf_px > 0 and projected > max_ok:
-                        logger.warning(
-                            "Hedge %s ABORT PM retry: projected entry_sum=%.3f "
-                            "(pf@%.3f + pm_ask@%.3f) > max %.3f — UNWIND PF",
-                            hedge.id, projected, pf_px, float(ask), max_ok,
-                        )
-                        hedge.pm_leg.status = "REJECTED"
-                        hedge.pm_leg.reject_reason = (
-                            f"retry ask too high ({projected:.3f} > {max_ok:.3f})"
-                        )
+                        # Always clear any resting PM orders first
                         try:
-                            await self._unwind_pf_leg(hedge)
+                            if hedge.pm_leg.order_id:
+                                await self.pm.cancel_order(hedge.pm_leg.order_id)
+                            await self.pm.cancel_all_orders()
                         except Exception as e:
-                            logger.error("PF unwind after PM abort failed: %s", e)
+                            logger.warning("PM clear on high-ask: %s", e)
+                        if ends_in < 40:
+                            logger.warning(
+                                "Hedge %s late ABORT PM (ends_in=%.0fs) projected=%.3f "
+                                "> max %.3f — UNWIND PF",
+                                hedge.id, ends_in, projected, max_ok,
+                            )
+                            hedge.pm_leg.status = "REJECTED"
+                            hedge.pm_leg.reject_reason = (
+                                f"retry ask too high ({projected:.3f} > {max_ok:.3f})"
+                            )
+                            try:
+                                await self._unwind_pf_leg(hedge)
+                            except Exception as e:
+                                logger.error("PF unwind after PM abort failed: %s", e)
+                            return
+                        logger.info(
+                            "Hedge %s PM ask high (proj=%.3f) ends_in=%.0fs — "
+                            "KEEP PF, no unwind (PM orders cancelled)",
+                            hedge.id, projected, ends_in,
+                        )
                         return
                     # Cancel previous resting order only
                     if hedge.pm_leg.order_id:

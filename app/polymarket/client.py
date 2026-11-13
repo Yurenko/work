@@ -595,8 +595,11 @@ class PolymarketClient:
             return {"status": "REJECTED", "reason": str(e)}
 
     async def cancel_order(self, order_id: str) -> bool:
-        """Cancel a resting CLOB order. Returns True if cancel call succeeded
-        or order is already gone / filled. Never raises.
+        """Cancel a resting CLOB order via py_clob_client_v2.
+
+        v2 requires OrderPayload(orderID=...), NOT a bare string.
+        Passing a string caused: 'str' object has no attribute 'orderID'
+        and we wrongly treated that as success — orders stayed live and filled later.
         """
         if not order_id:
             return False
@@ -605,65 +608,96 @@ class PolymarketClient:
             clob = self._ensure_clob()
             if clob is None:
                 return False
+
             last_err = None
-            for name in ("cancel", "cancel_order", "cancelOrder"):
+
+            # 1) Correct v2 API: cancel_order(OrderPayload(orderID=...))
+            try:
+                from py_clob_client_v2.clob_types import OrderPayload
+                payload = OrderPayload(orderID=oid)
+                res = clob.cancel_order(payload)
+                logger.info("PM cancel_order OrderPayload %s → %s", oid[:18], res)
+                return True
+            except ImportError:
+                pass
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                if any(x in msg for x in ("not found", "already canceled", "already cancelled", "does not exist")):
+                    logger.info("PM cancel %s already gone (%s)", oid[:18], e)
+                    return True
+                # Do NOT treat 'orderID' AttributeError as success
+                logger.warning("PM cancel_order(OrderPayload) %s: %s", oid[:18], e)
+
+            # 2) Bulk: cancel_orders([hash])
+            try:
+                if hasattr(clob, "cancel_orders"):
+                    res = clob.cancel_orders([oid])
+                    logger.info("PM cancel_orders [%s] → %s", oid[:18], res)
+                    return True
+            except Exception as e:
+                last_err = e
+                logger.warning("PM cancel_orders %s: %s", oid[:18], e)
+
+            # 3) Legacy string APIs
+            for name in ("cancel", "cancelOrder"):
                 fn = getattr(clob, name, None)
                 if not callable(fn):
                     continue
                 try:
                     res = fn(oid)
-                except TypeError:
-                    try:
-                        res = fn(order_id=oid)
-                    except Exception as e2:
-                        last_err = e2
-                        continue
-                except Exception as e1:
-                    # SDK sometimes throws weird errors on already-gone orders
-                    last_err = e1
-                    msg = str(e1).lower()
-                    if "not found" in msg or "already" in msg or "orderid" in msg:
-                        logger.info("PM cancel %s treated ok (%s)", oid[:18], e1)
-                        return True
-                    continue
-                # Success path — normalize result
-                try:
-                    logger.info("PM cancel %s → %s", oid[:18], res)
-                except Exception:
-                    logger.info("PM cancel %s → ok", oid[:18])
-                return True
+                    logger.info("PM %s(%s) → %s", name, oid[:18], res)
+                    return True
+                except Exception as e:
+                    last_err = e
+
+            # 4) Nuclear: cancel_all so orphans cannot fill later
+            try:
+                if hasattr(clob, "cancel_all"):
+                    res = clob.cancel_all()
+                    logger.warning("PM cancel_all fallback after single cancel fail → %s", res)
+                    return True
+            except Exception as e:
+                last_err = e
+                logger.warning("PM cancel_all fallback failed: %s", e)
+
             if last_err:
-                logger.warning("PM cancel %s failed: %s", oid[:18], last_err)
-            else:
-                logger.warning("PM cancel: no cancel method on ClobClient")
+                logger.warning("PM cancel %s ultimately failed: %s", oid[:18], last_err)
         except Exception as e:
             logger.warning("PM cancel %s failed: %s", oid[:18], e)
-        # Verify: if get_order says gone/filled, treat as success
+
+        # Verify — only claim success if order is gone
         try:
             st = await self.get_order(oid)
             if st is None:
                 return True
             status = str(st.get("status") or "").upper()
-            if status in ("REJECTED", "CANCELLED", "CANCELED", "FILLED", ""):
+            if status in ("REJECTED", "CANCELLED", "CANCELED", "FILLED"):
                 return True
-            if float(st.get("filledShares") or st.get("takingAmount") or 0) > 0.01:
-                return True  # partially/fully filled — no longer resting as open
+            matched = float(st.get("filledShares") or st.get("size_matched") or st.get("takingAmount") or 0)
+            if matched > 0.01 and status not in ("LIVE", "OPEN", "SUBMITTED"):
+                return True
+            logger.warning("PM cancel %s VERIFY still live status=%s", oid[:18], status)
         except Exception:
             pass
         return False
 
     async def cancel_all_orders(self) -> bool:
-        """Best-effort cancel all open CLOB orders (frees locked USDC)."""
+        """Cancel ALL open CLOB orders (frees locked USDC / removes orphans)."""
         try:
             clob = self._ensure_clob()
             if clob is None:
                 return False
-            for name in ("cancel_all", "cancelAll", "cancel_market_orders"):
+            if hasattr(clob, "cancel_all"):
+                res = clob.cancel_all()
+                logger.info("PM cancel_all → %s", res)
+                return True
+            for name in ("cancelAll",):
                 fn = getattr(clob, name, None)
                 if callable(fn):
                     try:
                         res = fn()
-                        logger.info("PM cancel_all → %s", res)
+                        logger.info("PM %s → %s", name, res)
                         return True
                     except Exception as e:
                         logger.warning("PM %s failed: %s", name, e)
