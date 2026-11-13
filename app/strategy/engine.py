@@ -491,6 +491,37 @@ class HedgeEngine:
             )
 
         async def _pm_buy(size: float, px: float):
+            # If we already hold this token (leftover from a prior abort), do NOT
+            # buy another full size — that caused 6+6=12 PM vs 6 PF.
+            try:
+                bal = float(await self.pm.get_token_balance(str(pm_token)) or 0)
+            except Exception:
+                bal = 0.0
+            if bal >= size * 0.85:
+                logger.warning(
+                    "PM pre-check: already hold %.4f of token — skip new buy",
+                    bal,
+                )
+                return {
+                    "status": "matched",
+                    "takingAmount": str(round(min(bal, size * 1.08), 4)),
+                    "makingAmount": str(round(min(bal, size) * float(px), 4)),
+                    "orderID": "pre-existing-pm",
+                    "success": True,
+                }
+            need = max(0.0, size - bal)
+            if need < 0.5 and bal >= 0.5:
+                logger.info("PM pre-check: shortfall %.4f tiny, use balance %.4f", need, bal)
+                return {
+                    "status": "matched",
+                    "takingAmount": str(round(bal, 4)),
+                    "makingAmount": str(round(bal * float(px), 4)),
+                    "orderID": "pre-existing-pm",
+                    "success": True,
+                }
+            if bal >= 0.5:
+                logger.info("PM pre-check: buy shortfall %.4f (already have %.4f)", need, bal)
+                size = need
             return await self.pm.place_market_buy(str(pm_token), size, px)
 
         # Use pm_px (ask+1¢) so GTC is more likely to match immediately
@@ -1004,6 +1035,16 @@ class HedgeEngine:
                                 "PF retry still not filled status=%s — leave unfilled",
                                 pf_fill2.status,
                             )
+                            # Keep tracking the retry order as SUBMITTED (not the
+                            # original REJECTED) so we don't abort-and-naked the PM leg.
+                            if pf_fill2.order_id:
+                                pf_fill = Fill(
+                                    status="SUBMITTED",
+                                    shares=0,
+                                    price=px,
+                                    order_id=pf_fill2.order_id,
+                                    reason="retry resting",
+                                )
                         # Mark that entry path already used the one allowed extra buy
                         try:
                             hedge._pf_extra_buys = 1
@@ -1041,20 +1082,45 @@ class HedgeEngine:
             reason = (pf_fill.reason or "").lower()
             self._entry_busy = False
             logger.warning("PF reject %s — abort pair", pf_fill.reason)
-            # Critical: kill any PM GTC that may still be resting
+            # 1) Cancel any resting PM GTC
             try:
                 if pm_fill.order_id:
                     await self.pm.cancel_order(pm_fill.order_id)
                 await self.pm.cancel_all_orders()
-                logger.info("PM cleared after PF reject")
             except Exception as e:
-                logger.warning("PM clear after PF reject: %s", e)
+                logger.warning("PM cancel after PF reject: %s", e)
+            # 2) If PM already FILLED, must SELL to unwind (cancel does nothing on matched)
+            pm_sh = float(pm_fill.shares or 0) if pm_fill.status == "FILLED" else 0.0
+            if pm_sh < 0.5:
+                try:
+                    bal = await self.pm.get_token_balance(str(pm_token))
+                    if bal >= 0.5:
+                        pm_sh = bal
+                except Exception:
+                    pass
+            if pm_sh >= 0.5:
+                try:
+                    bid, _ = self._pm_best(pm_dir)
+                    sell_px = max(0.01, round(float(bid or 0.01) - 0.02, 2))
+                    logger.warning(
+                        "PF reject with PM filled %.4f — UNWIND sell PM @ %.2f",
+                        pm_sh, sell_px,
+                    )
+                    await self.pm.place_market_sell(str(pm_token), pm_sh, sell_px)
+                    logger.info("PM unwind sell submitted after PF reject")
+                except Exception as e:
+                    logger.error("PM unwind sell FAILED after PF reject: %s", e)
+                    self.last_error = f"PM naked leg after PF reject: {e}"
+            else:
+                logger.info("PM cleared after PF reject (no filled shares)")
             if "jurisdiction" in reason or "403" in reason or "forbidden" in reason:
                 self.pf_entry_cooldown_until = time.time() + 3600.0
                 self.last_error = "Predict 403: not available in your jurisdiction"
             elif "insufficient" in reason or "collateral" in reason or "balance" in reason:
                 self.pf_entry_cooldown_until = time.time() + 120.0
                 self.last_error = "Predict insufficient USDT balance/allowance"
+            elif "precision" in reason:
+                self.pf_entry_cooldown_until = time.time() + 3.0
             else:
                 self.pf_entry_cooldown_until = time.time() + 8.0
             return

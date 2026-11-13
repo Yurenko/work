@@ -781,10 +781,14 @@ class PredictClient:
         In PAPER mode returns a simulated FILLED response.
         Live mode requires JWT + signed order body (via SDK when available).
         """
-        price = round(float(price), 2)  # Predict max 2 decimal places
+        # Predict API hard-limit: max 2 decimal places (create_order_price_precision_too_high)
+        price = round(float(price) + 1e-12, 2)
+        if price <= 0:
+            price = 0.01
+        if price >= 1:
+            price = 0.99
         side = side.upper()
         shares = float(shares)
-        price = round(float(price), 4)
 
         if not self.settings.is_live:
             usd = round(shares * price, 4)
@@ -877,10 +881,11 @@ class PredictClient:
         fee_bps = int(mkt.get("feeRateBps") or 200)
         is_neg = bool(mkt.get("isNegRisk"))
         is_yield = bool(mkt.get("isYieldBearing"))
-        precision = int(mkt.get("decimalPrecision") or 2)
+        # API rejects >2 decimals even if market metadata says otherwise
+        precision = min(2, int(mkt.get("decimalPrecision") or 2))
 
-        # Round price to market precision
-        price = round(float(price), precision)
+        # Round price to max 2 decimal places
+        price = round(float(price) + 1e-12, precision)
         if not (0 < price < 1):
             raise RuntimeError(f"price out of range: {price}")
 
