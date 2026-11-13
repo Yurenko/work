@@ -1135,6 +1135,96 @@ class HedgeEngine:
             return
 
         if pf_fill.status == "FILLED" and pm_fill.status == "FILLED":
+            pf_s = float(pf_fill.shares or 0)
+            pm_s = float(pm_fill.shares or 0)
+            # Critical: never leave OPEN with large share mismatch (e.g. 17.7 vs 2.5).
+            # Match down to the smaller leg by selling excess on the larger venue.
+            if pf_s >= 0.5 and pm_s >= 0.5:
+                ratio = max(pf_s, pm_s) / max(min(pf_s, pm_s), 0.01)
+                if ratio > 1.20 or abs(pf_s - pm_s) >= 1.0:
+                    target_match = min(pf_s, pm_s)
+                    logger.warning(
+                        "Hedge %s fill imbalance PF=%.2f PM=%.2f → match down to %.2f",
+                        hedge.id, pf_s, pm_s, target_match,
+                    )
+                    if pf_s > target_match + 0.4:
+                        excess = round(pf_s - target_match, 4)
+                        try:
+                            bid, _ = self._pf_best(pf_m["id"], pf_dir)
+                            sell_px = max(0.01, round(float(bid or 0.01) - 0.02, 2))
+                            logger.warning(
+                                "Sell excess PF %.4f @ %.2f to match PM", excess, sell_px,
+                            )
+                            await self.pf.place_order(
+                                pf_m["id"], "SELL", excess, sell_px,
+                                is_yes=(pf_dir == "up"),
+                            )
+                            pf_s = target_match
+                            self._apply_fill(
+                                hedge.pf_leg,
+                                Fill(
+                                    status="FILLED",
+                                    shares=round(pf_s, 4),
+                                    price=float(hedge.pf_leg.entry_price or pf_fill.price or 0),
+                                    usd=round(pf_s * float(hedge.pf_leg.entry_price or pf_fill.price or 0), 4),
+                                    order_id=pf_fill.order_id,
+                                ),
+                            )
+                        except Exception as e:
+                            logger.error("Failed to sell excess PF: %s", e)
+                    if pm_s > target_match + 0.4:
+                        excess = round(pm_s - target_match, 4)
+                        try:
+                            bid, _ = self._pm_best(pm_dir)
+                            sell_px = max(0.01, round(float(bid or 0.01) - 0.02, 2))
+                            logger.warning(
+                                "Sell excess PM %.4f @ %.2f to match PF", excess, sell_px,
+                            )
+                            await self.pm.place_market_sell(str(pm_token), excess, sell_px)
+                            pm_s = target_match
+                            self._apply_fill(
+                                hedge.pm_leg,
+                                Fill(
+                                    status="FILLED",
+                                    shares=round(pm_s, 4),
+                                    price=float(hedge.pm_leg.entry_price or pm_fill.price or 0),
+                                    usd=round(pm_s * float(hedge.pm_leg.entry_price or pm_fill.price or 0), 4),
+                                    order_id=pm_fill.order_id,
+                                ),
+                            )
+                        except Exception as e:
+                            logger.error("Failed to sell excess PM: %s", e)
+                    # If still badly unbalanced (e.g. PM only 2.5 of 17), abort hedge:
+                    # sell both legs rather than hold naked exposure.
+                    pf_s = float(hedge.pf_leg.filled_shares or pf_s)
+                    pm_s = float(hedge.pm_leg.filled_shares or pm_s)
+                    if max(pf_s, pm_s) / max(min(pf_s, pm_s), 0.01) > 1.5:
+                        logger.error(
+                            "Hedge %s still unbalanced PF=%.2f PM=%.2f after match-down — UNWIND both",
+                            hedge.id, pf_s, pm_s,
+                        )
+                        try:
+                            if pm_s >= 0.5:
+                                bid, _ = self._pm_best(pm_dir)
+                                await self.pm.place_market_sell(
+                                    str(pm_token), pm_s,
+                                    max(0.01, round(float(bid or 0.01) - 0.02, 2)),
+                                )
+                            if pf_s >= 0.5:
+                                bid, _ = self._pf_best(pf_m["id"], pf_dir)
+                                await self.pf.place_order(
+                                    pf_m["id"], "SELL", pf_s,
+                                    max(0.01, round(float(bid or 0.01) - 0.02, 2)),
+                                    is_yes=(pf_dir == "up"),
+                                )
+                        except Exception as e:
+                            logger.error("Full unwind after imbalance failed: %s", e)
+                        hedge.status = "CLOSED"
+                        hedge.closed_at = time.time()
+                        self._entry_busy = False
+                        self.pf_entry_cooldown_until = time.time() + 15.0
+                        return
+
             hedge.status = "OPEN"
             self._entry_busy = False
             # Real entry sum from actual fill prices (not pre-trade quote sum)
@@ -1144,8 +1234,10 @@ class HedgeEngine:
             logger.info(
                 "Hedge %s OPEN PF %.2f@%.3f + PM %.2f@%.3f entry_sum=%.3f",
                 hedge.id,
-                pf_fill.shares, hedge.pf_leg.entry_price,
-                pm_fill.shares, hedge.pm_leg.entry_price,
+                float(hedge.pf_leg.filled_shares or pf_fill.shares),
+                hedge.pf_leg.entry_price,
+                float(hedge.pm_leg.filled_shares or pm_fill.shares),
+                hedge.pm_leg.entry_price,
                 hedge.entry_sum,
             )
             # Re-pull real avg/shares from venues at T+30s and T+90s (API lag)
@@ -1573,6 +1665,14 @@ class HedgeEngine:
                     hedge.id, hedge.entry_sum, max_ok,
                     hedge.pf_leg.filled_shares, hedge.pf_leg.entry_price,
                     hedge.pm_leg.filled_shares, hedge.pm_leg.entry_price,
+                )
+                return
+            pf_s = float(hedge.pf_leg.filled_shares or 0)
+            pm_s = float(hedge.pm_leg.filled_shares or 0)
+            if pf_s >= 0.5 and pm_s >= 0.5 and max(pf_s, pm_s) / max(min(pf_s, pm_s), 0.01) > 1.25:
+                logger.warning(
+                    "Hedge %s promote blocked: imbalance PF=%.2f PM=%.2f — keep PARTIAL",
+                    hedge.id, pf_s, pm_s,
                 )
                 return
             hedge.status = "OPEN"

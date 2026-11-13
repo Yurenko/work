@@ -25,7 +25,8 @@ class Settings(BaseSettings):
     pm_shares: float = 6.0
     base_shares: float = 6.0
     shares_step: float = 6.0
-    max_shares: float = 20.0
+    # Keep recovery modest — large sizes + thin PM books caused 17 vs 2.5 imbalance
+    max_shares: float = 12.0
     max_recovery_debt_usd: float = 50.0
     bn_min_usd: float = 1.0  # kept name for recovery sizing; means PF min notional
     max_open_hedges: int = 2
