@@ -127,11 +127,36 @@ def fill_from_pm_order(resp: Any, requested: float = 0.0, side: str = "BUY") -> 
     if price > 1.5:
         price = min(price, 1.5)
 
+    # original_size / remaining help detect partial MATCHED still resting
+    original = _num(
+        resp.get("original_size")
+        or resp.get("originalSize")
+        or resp.get("size")
+        or resp.get("makerAmount")
+        or 0
+    )
+    # Some APIs put requested shares in "size" and matched in size_matched
+    size_matched = _num(resp.get("size_matched") or resp.get("sizeMatched") or 0)
+    if size_matched > shares:
+        shares = size_matched
+
     if status in ("FILLED", "MATCHED"):
         if shares <= 0:
             shares = requested
             if price > 0:
                 usd = shares * price
+        # If we requested a larger GTC (min-notional bump) and only part matched,
+        # treat as SUBMITTED so the engine keeps polling / can cancel remainder.
+        # Only mark FILLED when matched ≥ 90% of requested OR order is fully done.
+        if requested > 0 and shares > 0 and shares < requested * 0.90:
+            return Fill(
+                status="SUBMITTED",
+                shares=round(shares, 4),
+                price=round(price, 4) if price else 0.0,
+                usd=round(usd or shares * (price or 0), 4),
+                order_id=oid,
+                reason=f"partial {shares:.4f}/{requested:.4f}",
+            )
         return Fill(
             status="FILLED",
             shares=round(shares, 4),
@@ -139,10 +164,29 @@ def fill_from_pm_order(resp: Any, requested: float = 0.0, side: str = "BUY") -> 
             usd=round(usd or shares * price, 4),
             order_id=oid,
         )
-    if status in ("REJECTED", "FAILED") or (reason and "couldn't be fully filled" in reason.lower()):
+    if status in ("REJECTED", "FAILED", "CANCELLED", "CANCELED") or (
+        reason and "couldn't be fully filled" in reason.lower()
+    ):
+        # Cancelled order may still have partial fills — report them as FILLED if any
+        if shares >= 0.5:
+            return Fill(
+                status="FILLED",
+                shares=round(shares, 4),
+                price=round(price, 4) if price else 0.0,
+                usd=round(usd or shares * (price or 0), 4),
+                order_id=oid,
+                reason="partial after cancel",
+            )
         return Fill(status="REJECTED", reason=reason or status, order_id=oid)
     if status in ("LIVE", "OPEN", "SUBMITTED"):
-        return Fill(status="SUBMITTED", shares=shares, price=price, order_id=oid, reason=reason)
+        return Fill(
+            status="SUBMITTED",
+            shares=round(shares, 4) if shares else 0.0,
+            price=round(price, 4) if price else 0.0,
+            usd=round(usd or (shares * price if shares and price else 0), 4),
+            order_id=oid,
+            reason=reason,
+        )
     if reason:
         return Fill(status="REJECTED", reason=reason, order_id=oid)
     return Fill(status="SUBMITTED", shares=shares, price=price, order_id=oid)
