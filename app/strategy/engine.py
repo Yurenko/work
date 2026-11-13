@@ -880,28 +880,33 @@ class HedgeEngine:
                     sh, ap,
                 )
             else:
-                # Cancel resting only after polls show we still need shares
-                if pf_fill.order_id:
-                    try:
-                        await self.pf.cancel_order(str(pf_fill.order_id))
-                        logger.info("PF cancel resting %s before retry", pf_fill.order_id)
-                    except Exception as e:
-                        logger.warning("PF cancel before retry: %s", e)
-                    # Cancel may race with fill — poll again after cancel
-                    await _asyncio.sleep(1.5)
-                    try:
+                # Cancel ALL open PF orders for this market (not just tracked id).
+                # Multiple resting limits were the cause of 6→17 shares overfill.
+                try:
+                    n = await self.pf.cancel_all_open_orders(pf_m["id"])
+                    logger.info("PF cancel_all_open before retry market=%s n=%s", pf_m["id"], n)
+                except Exception as e:
+                    logger.warning("PF cancel_all before retry: %s", e)
+                    if pf_fill.order_id:
                         try:
-                            pos = await self.pf.get_position_for_market(
-                                pf_m["id"], is_yes=(pf_dir == "up")
-                            )
-                        except TypeError:
-                            pos = await self.pf.get_position_for_market(pf_m["id"])
-                        if pos:
-                            live_sh = float(pos.get("shares") or 0)
-                            live_avg = float(pos.get("avg_price") or 0)
-                            live_usd = float(pos.get("cost_usd") or 0) or (live_sh * live_avg)
-                    except Exception as e:
-                        logger.warning("PF post-cancel live check: %s", e)
+                            await self.pf.cancel_order(str(pf_fill.order_id))
+                        except Exception:
+                            pass
+                # Cancel races with fill — wait and re-read position + activity
+                await _asyncio.sleep(2.0)
+                try:
+                    try:
+                        pos = await self.pf.get_position_for_market(
+                            pf_m["id"], is_yes=(pf_dir == "up")
+                        )
+                    except TypeError:
+                        pos = await self.pf.get_position_for_market(pf_m["id"])
+                    if pos:
+                        live_sh = float(pos.get("shares") or 0)
+                        live_avg = float(pos.get("avg_price") or 0)
+                        live_usd = float(pos.get("cost_usd") or 0) or (live_sh * live_avg)
+                except Exception as e:
+                    logger.warning("PF post-cancel live check: %s", e)
 
                 if live_sh >= max(0.5, order_shares * 0.85):
                     sh = min(live_sh, order_shares * 1.08)
@@ -930,7 +935,7 @@ class HedgeEngine:
                         filled_pf = float(pf_fill.shares)
                         logger.info("PF near target from live %.4f — no new buy", sh)
                     else:
-                        # Only shortfall, never full size again
+                        # ONE shortfall retry only — never stack full-size limits
                         px = round(min(0.99, float(pf_px) + 0.02), 2)
                         logger.info(
                             "PF retry buy SHORTFALL need=%.4f @ %.2f (live had %.4f)",
@@ -999,6 +1004,11 @@ class HedgeEngine:
                                 "PF retry still not filled status=%s — leave unfilled",
                                 pf_fill2.status,
                             )
+                        # Mark that entry path already used the one allowed extra buy
+                        try:
+                            hedge._pf_extra_buys = 1
+                        except Exception:
+                            pass
 
         # Cancel any leftover PM resting order
         if pm_fill.status == "SUBMITTED" and pm_fill.order_id:
@@ -1194,22 +1204,57 @@ class HedgeEngine:
                     sh, px, live_sh,
                 )
             elif getattr(hedge, "_pf_extra_buys", 0) >= 1:
-                # Already placed one extra buy this hedge — stop spamming
+                # Already placed one extra buy this hedge — stop spamming.
+                # Still cancel any leftover OPEN limits so they cannot fill later.
+                try:
+                    await self.pf.cancel_all_open_orders(mid)
+                except Exception:
+                    pass
                 logger.warning(
-                    "PF retry: already did 1 extra buy, live=%.4f need=%.4f — waiting",
+                    "PF retry: already did 1 extra buy, live=%.4f need=%.4f — waiting (no new order)",
                     live_sh, need,
                 )
             else:
-                # Cancel resting, buy ONLY the shortfall
-                if hedge.pf_leg.order_id:
+                # Cancel ALL open PF orders for market, then at most ONE shortfall buy
+                try:
+                    n = await self.pf.cancel_all_open_orders(mid)
+                    logger.info("PF cancel_all before manage retry market=%s n=%s", mid, n)
+                except Exception as e:
+                    logger.warning("PF cancel_all manage: %s", e)
+                    if hedge.pf_leg.order_id:
+                        try:
+                            await self.pf.cancel_order(str(hedge.pf_leg.order_id))
+                        except Exception:
+                            pass
+                hedge.pf_leg.order_id = ""
+                import asyncio as _aio
+                await _aio.sleep(2.0)
+                # Re-check position after cancel — fills may have landed
+                try:
                     try:
-                        await self.pf.cancel_order(str(hedge.pf_leg.order_id))
-                        logger.info("PF cancel before retry buy id=%s", hedge.pf_leg.order_id)
-                    except Exception as e:
-                        logger.warning("PF cancel before retry: %s", e)
-                    hedge.pf_leg.order_id = ""
-
-                shortfall = max(0.0, need - live_sh)
+                        pos2 = await self.pf.get_position_for_market(mid, is_yes=is_yes)
+                    except TypeError:
+                        pos2 = await self.pf.get_position_for_market(mid)
+                    if pos2:
+                        live_sh = float(pos2.get("shares") or 0)
+                        live_usd = float(pos2.get("cost_usd") or 0) or live_usd
+                        live_avg = float(pos2.get("avg_price") or live_avg or 0)
+                except Exception:
+                    pass
+                if live_sh >= max(0.5, need * 0.85):
+                    sh = min(live_sh, need * 1.08)
+                    px = (live_usd / live_sh) if (live_usd > 0 and live_sh > 0) else live_avg
+                    if not (0.01 <= px <= 1.0):
+                        px = 0.5
+                    self._apply_fill(
+                        hedge.pf_leg,
+                        Fill(status="FILLED", shares=round(sh, 4), price=round(px, 4),
+                             usd=round(live_usd or sh * px, 4), order_id=hedge.pf_leg.order_id),
+                    )
+                    logger.info("PF manage: filled after cancel_all %.4f — no new buy", sh)
+                    shortfall = 0.0
+                else:
+                    shortfall = max(0.0, need - live_sh)
                 _, ask = self._pf_best(mid, hedge.pf_leg.direction)
                 if ask and shortfall >= 0.5:
                     px = min(0.99, round(float(ask) + 0.02, 2))  # 2 decimals max

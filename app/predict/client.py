@@ -1231,6 +1231,82 @@ class PredictClient:
         logger.info("PF cancel id=%s hash=%s → %s", order_id, (order_hash or "")[:16], data)
         return data is not None
 
+    async def list_open_orders(self, market_id: int | str | None = None) -> list[dict]:
+        """GET /v1/orders?status=OPEN — optionally filter by market id."""
+        if not self.settings.is_live:
+            return []
+        await self.ensure_jwt()
+        params: dict = {"status": "OPEN"}
+        if market_id is not None:
+            params["marketId"] = str(market_id)
+        data = await self._request("GET", "/v1/orders", params=params, with_jwt=True)
+        if not data:
+            return []
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for k in ("data", "orders", "items", "results"):
+                v = data.get(k)
+                if isinstance(v, list):
+                    return v
+        return []
+
+    async def cancel_all_open_orders(self, market_id: int | str | None = None) -> int:
+        """Cancel every OPEN order (optionally for one market). Returns count attempted."""
+        orders = await self.list_open_orders(market_id)
+        if not orders:
+            # Try without market filter if filtered returned empty
+            if market_id is not None:
+                orders = await self.list_open_orders(None)
+                if market_id is not None and orders:
+                    mid = str(market_id)
+                    filtered = []
+                    for o in orders:
+                        om = str(
+                            o.get("marketId")
+                            or o.get("market_id")
+                            or (o.get("market") or {}).get("id")
+                            or ""
+                        )
+                        if om == mid or mid in om:
+                            filtered.append(o)
+                    orders = filtered or orders
+        ids: list[str] = []
+        hashes: list[str] = []
+        for o in orders:
+            oid = str(o.get("id") or o.get("orderId") or "")
+            oh = ""
+            order_obj = o.get("order") if isinstance(o.get("order"), dict) else {}
+            if order_obj:
+                oh = str(order_obj.get("hash") or "")
+            oh = oh or str(o.get("orderHash") or o.get("hash") or "")
+            if oid:
+                ids.append(oid)
+            elif oh:
+                hashes.append(oh)
+        cancelled = 0
+        if ids:
+            # Batch remove by ids
+            data = await self._request(
+                "POST",
+                "/v1/orders/remove",
+                json_body={"data": {"ids": ids}},
+                with_jwt=True,
+            )
+            logger.info("PF cancel_all ids=%s → %s", ids[:8], data)
+            cancelled += len(ids)
+        if hashes:
+            data = await self._request(
+                "POST",
+                "/v1/orders/remove-by-hash",
+                json_body={"data": {"hashes": hashes}},
+                with_jwt=True,
+            )
+            logger.info("PF cancel_all hashes=%s → %s", [h[:12] for h in hashes[:8]], data)
+            cancelled += len(hashes)
+        if cancelled:
+            logger.info("PF cancel_all_open market=%s count=%d", market_id, cancelled)
+        return cancelled
 
     async def get_order(self, order_id: str) -> Optional[dict]:
         if not self.settings.is_live:
