@@ -136,9 +136,9 @@
         <h2>Open hedges</h2>
         <table>
           <thead><tr>
-            <th>Market</th><th>Status</th><th>Predict</th><th>Polymarket</th><th>Entry Σ</th>
+            <th>Market</th><th>Status</th><th>Predict</th><th>Polymarket</th><th>Entry Σ</th><th>PF Lock</th>
           </tr></thead>
-          <tbody id="openBody"><tr><td colspan="5" class="muted">none</td></tr></tbody>
+          <tbody id="openBody"><tr><td colspan="6" class="muted">none</td></tr></tbody>
         </table>
       </div>
       <div class="card full">
@@ -268,10 +268,18 @@
     const hedges = s.open_hedges || [];
     const oh = $('openBody');
     if (!hedges.length) {
-      oh.innerHTML = '<tr><td colspan="5" class="muted">none</td></tr>';
+      oh.innerHTML = '<tr><td colspan="6" class="muted">none</td></tr>';
     } else {
       oh.innerHTML = hedges.map(h => {
-        return `<tr><td>${marketLabel(h)}</td><td>${h.status||''}</td><td>${legHtml(h.bn, false)}</td><td>${legHtml(h.pm, false)}</td><td>${fmt(h.entry_sum,3)}</td></tr>`;
+        const lk = h.lock || {};
+        let lockCell = '—';
+        if (lk.px || lk.status) {
+          const dir = (lk.dir || '').toUpperCase();
+          const st = lk.status || '';
+          const formula = lk.formula ? `<div class="muted">${lk.formula}</div>` : '';
+          lockCell = `<span class="${st==='FILLED'?'up':''}">${dir} ${fmt(lk.px,2)} × ${fmt(lk.shares,1)}<br>${st}${formula}</span>`;
+        }
+        return `<tr><td>${marketLabel(h)}</td><td>${h.status||''}</td><td>${legHtml(h.bn, false)}</td><td>${legHtml(h.pm, false)}</td><td>${fmt(h.entry_sum,3)}</td><td>${lockCell}</td></tr>`;
       }).join('');
     }
 
