@@ -5,8 +5,10 @@ Rules:
 2. If either opposite pair sums to < ENTRY_SUM_MAX, buy that pair.
    Never the same direction on both exchanges.
 3. Exit when the two bids sum to >= EXIT_SUM_MIN.
-4. Same share count on both venues (min ~5 on Polymarket).
-5. Buy Predict first; Polymarket after Predict accepts, for the filled size.
+4. Share sizing: PF buys base+pf_extra_shares, PM buys base (e.g. 10 vs 6).
+   Immediately place PF limit SELL for the excess at entry+pf_trim_offset
+   so remaining PF ≈ PM after the trim fills.
+5. All tracking uses actual fills (shares, avg, fees).
 """
 
 from __future__ import annotations
@@ -57,20 +59,21 @@ class Hedge:
     closed_at: float = 0.0
     exit_sum: float = 0.0
     pnl: float = 0.0
-    close_reason: str = ""  # EXIT | SETTLE | LOCK
+    close_reason: str = ""  # EXIT | SETTLE
     retries: int = 0
     last_retry_at: float = 0.0
     pm_slug: str = ""  # fixed at open — used for resolution (not current window)
     pf_market_id: str = ""
-    # Complete-set lock: after entry, rest PF limit on opposite side at
-    # 1 - pf_entry - pm_entry. When filled → sell PM. Tracks live until fill.
-    pf_lock_dir: str = ""          # opposite of pf_leg.direction
-    pf_lock_px: float = 0.0        # target limit price
-    pf_lock_shares: float = 0.0
-    pf_lock_order_id: str = ""
-    pf_lock_status: str = ""       # ""|SUBMITTED|FILLED|CANCELLED
-    pf_lock_filled_shares: float = 0.0
-    pf_lock_entry_usd: float = 0.0
+    # Target net shares to keep after PF trim (usually = PM size / base_shares)
+    target_net: float = 0.0
+    # PF limit-sell of intentional excess (entry + offset)
+    pf_trim_order_id: str = ""
+    pf_trim_shares: float = 0.0       # remaining to sell
+    pf_trim_target: float = 0.0       # original excess size
+    pf_trim_px: float = 0.0
+    pf_trim_status: str = ""          # ""|SUBMITTED|PARTIAL|FILLED|CANCELLED|SKIPPED
+    pf_trim_filled: float = 0.0
+    pf_trim_proceeds: float = 0.0
     # aliases for recovery/tests that still say bn
     @property
     def bn_leg(self) -> Leg:
@@ -459,22 +462,27 @@ class HedgeEngine:
         )
         self.hedges.append(hedge)
 
-        # Simultaneous LIMIT buys on both venues with the SAME share target.
-        # PF: aggressive limit (ask+slip). PM: GTC resting limit at ask (not FAK —
-        # FAK fails on thin books and left PF naked). Wait ~7s for fills.
+        # Simultaneous LIMIT buys: PF oversized, PM at target_net.
+        # PF: base + pf_extra_shares (e.g. 10). PM: base (e.g. 6).
+        # After PF fill → limit-sell excess at entry + pf_trim_offset.
         import asyncio as _asyncio
 
-        # Same share count on both venues. Do NOT inflate for fee — that caused
-        # confusion and double-fill tracking (6 vs 12). Fee is paid in cash/shares
-        # by the venue; we track actual fill after the fact.
-        order_shares = round(float(shares), 4)
-        target_net = float(shares)
+        target_net = round(float(shares), 4)
+        extra = max(0.0, float(self.settings.pf_extra_shares or 0))
+        pf_order_shares = round(target_net + extra, 4)
+        pm_order_shares = target_net
+        order_shares = pf_order_shares  # used by PF path / pre-checks
+        hedge.target_net = target_net
+        hedge.pf_leg.requested_shares = pf_order_shares
+        hedge.pm_leg.requested_shares = pm_order_shares
         pf_px = min(0.99, round(float(pf_ask) + 0.03, 2))
         pm_px = min(0.99, round(float(pm_ask) + 0.01, 2))  # 1¢ slip to cross
 
         logger.info(
-            "LIMIT ENTRY simultaneous target_net=%.2f PF order=%.4f @ %.2f | PM size=%.4f @ %.2f",
-            target_net, order_shares, pf_px, target_net, pm_px,
+            "LIMIT ENTRY simultaneous target_net=%.2f PF order=%.4f (+%.2f extra) @ %.2f | "
+            "PM size=%.4f @ %.2f | trim_offset=%.2f",
+            target_net, pf_order_shares, extra, pf_px, pm_order_shares, pm_px,
+            float(self.settings.pf_trim_offset or 0),
         )
 
         # CRITICAL: if PM cannot take target size at this ask (CLOB $1 min-notional),
@@ -511,17 +519,18 @@ class HedgeEngine:
                 pre_pos = await self.pf.get_position_for_market(pf_m["id"])
             if pre_pos:
                 pre_live = float(pre_pos.get("shares") or 0)
-                if pre_live >= target_net * 0.85:
-                    logger.warning(
-                        "PF pre-check: market %s already has %.4f shares on %s — "
-                        "will NOT place new buy (prevent double-fill)",
-                        pf_m["id"], pre_live, pf_dir,
-                    )
+                # Only skip if already near full PF order size (base+extra)
+            if pre_live >= order_shares * 0.85:
+                logger.warning(
+                    "PF pre-check: market %s already has %.4f shares on %s — "
+                    "will NOT place new buy (prevent double-fill)",
+                    pf_m["id"], pre_live, pf_dir,
+                )
         except Exception as e:
             logger.debug("PF pre-check: %s", e)
 
         async def _pf_buy():
-            if pre_live >= target_net * 0.85:
+            if pre_live >= order_shares * 0.85:
                 # Fake a filled response from existing position
                 return {
                     "status": "FILLED",
@@ -591,12 +600,13 @@ class HedgeEngine:
                         pos = await self.pf.get_position_for_market(
                             pf_m["id"], is_yes=(pf_dir == "up"),
                         )
-                        if pos and float(pos.get("shares") or 0) >= target_net * 0.9:
+                        # Accept when we have most of the oversized PF order (base+extra)
+                        if pos and float(pos.get("shares") or 0) >= order_shares * 0.85:
                             sh = float(pos["shares"])
                             px = float(pos.get("avg_price") or pf_px)
                             cu = float(pos.get("cost_usd") or 0) or sh * px
                             pf_fill = Fill(
-                                status="FILLED", shares=min(sh, order_shares),
+                                status="FILLED", shares=min(sh, order_shares * 1.05),
                                 price=px if 0 < px <= 1 else pf_px,
                                 usd=cu, order_id=pf_fill.order_id,
                             )
@@ -760,23 +770,24 @@ class HedgeEngine:
                         price=pm_fill.price,
                     )
 
-        # Cap PF shares to target (positions API can return total market size)
-        if pf_fill.status == "FILLED" and pf_fill.shares > target_net * 1.05:
+        # Cap PF shares to planned order size (base+extra), not target_net —
+        # intentional oversize is trimmed later via limit sell.
+        if pf_fill.status == "FILLED" and pf_fill.shares > order_shares * 1.12:
             logger.warning(
-                "PF fill shares %.4f > target %.4f — cap to target for PM match",
-                pf_fill.shares, target_net,
+                "PF fill shares %.4f > planned %.4f — cap to planned order size",
+                pf_fill.shares, order_shares,
             )
-            # keep price, scale usd
             if pf_fill.shares > 0 and pf_fill.usd:
                 px = pf_fill.usd / pf_fill.shares
                 pf_fill = Fill(
-                    status="FILLED", shares=target_net, price=px,
-                    usd=target_net * px, order_id=pf_fill.order_id,
+                    status="FILLED", shares=order_shares, price=px,
+                    usd=order_shares * px, order_id=pf_fill.order_id,
                 )
             else:
                 pf_fill = Fill(
-                    status="FILLED", shares=target_net,
-                    price=pf_fill.price or pf_px, usd=target_net * float(pf_fill.price or pf_px),
+                    status="FILLED", shares=order_shares,
+                    price=pf_fill.price or pf_px,
+                    usd=order_shares * float(pf_fill.price or pf_px),
                     order_id=pf_fill.order_id,
                 )
 
@@ -790,7 +801,7 @@ class HedgeEngine:
                     cu = float(act.get("cost_usd") or 0)
                     ap = float(act.get("avg_price") or 0)
                     ash = float(act.get("shares") or 0) or float(pf_fill.shares)
-                    ash = min(ash, target_net * 1.05)
+                    ash = min(ash, order_shares * 1.12)
                     if cu > 0 and ash > 0:
                         if cu / ash > 1.5 and cu > 50:
                             cu = cu / 100.0
@@ -1180,138 +1191,110 @@ class HedgeEngine:
         if pf_fill.status == "FILLED" and pm_fill.status == "FILLED":
             pf_s = float(pf_fill.shares or 0)
             pm_s = float(pm_fill.shares or 0)
-            # Critical: never leave OPEN with large share mismatch (e.g. 17.7 vs 2.5).
-            # Match down to the smaller leg by selling excess on the larger venue.
+            # Intentional PF oversize is expected (base+extra vs base).
+            # Only treat as error if PM is nearly empty or PF is far above planned size.
+            planned_pf = float(order_shares)
             if pf_s >= 0.5 and pm_s >= 0.5:
-                ratio = max(pf_s, pm_s) / max(min(pf_s, pm_s), 0.01)
-                if ratio > 1.20 or abs(pf_s - pm_s) >= 1.0:
-                    target_match = min(pf_s, pm_s)
-                    logger.warning(
-                        "Hedge %s fill imbalance PF=%.2f PM=%.2f → match down to %.2f",
-                        hedge.id, pf_s, pm_s, target_match,
+                # Unexpected: PM overfilled well past target_net
+                if pm_s > target_net * 1.25 + 0.5:
+                    excess = round(pm_s - target_net, 4)
+                    try:
+                        bid, _ = self._pm_best(pm_dir)
+                        sell_px = max(0.01, round(float(bid or 0.01) - 0.02, 2))
+                        logger.warning(
+                            "Sell unexpected PM excess %.4f @ %.2f (target_net=%.2f)",
+                            excess, sell_px, target_net,
+                        )
+                        await self.pm.place_market_sell(str(pm_token), excess, sell_px)
+                        pm_s = target_net
+                        self._apply_fill(
+                            hedge.pm_leg,
+                            Fill(
+                                status="FILLED",
+                                shares=round(pm_s, 4),
+                                price=float(hedge.pm_leg.entry_price or pm_fill.price or 0),
+                                usd=round(pm_s * float(hedge.pm_leg.entry_price or pm_fill.price or 0), 4),
+                                order_id=pm_fill.order_id,
+                            ),
+                        )
+                    except Exception as e:
+                        logger.error("Failed to sell unexpected PM excess: %s", e)
+                # Unexpected: PF far above planned (base+extra) → market-sell the runaway part
+                if pf_s > planned_pf * 1.25 + 0.5:
+                    runaway = round(pf_s - planned_pf, 4)
+                    try:
+                        bid, _ = self._pf_best(pf_m["id"], pf_dir)
+                        sell_px = max(0.01, round(float(bid or 0.01) - 0.02, 2))
+                        logger.warning(
+                            "Sell runaway PF %.4f @ %.2f (planned=%.2f)",
+                            runaway, sell_px, planned_pf,
+                        )
+                        await self.pf.place_order(
+                            pf_m["id"], "SELL", runaway, sell_px,
+                            is_yes=(pf_dir == "up"),
+                        )
+                        pf_s = planned_pf
+                        self._apply_fill(
+                            hedge.pf_leg,
+                            Fill(
+                                status="FILLED",
+                                shares=round(pf_s, 4),
+                                price=float(hedge.pf_leg.entry_price or pf_fill.price or 0),
+                                usd=round(pf_s * float(hedge.pf_leg.entry_price or pf_fill.price or 0), 4),
+                                order_id=pf_fill.order_id,
+                            ),
+                        )
+                    except Exception as e:
+                        logger.error("Failed to sell runaway PF: %s", e)
+                # Catastrophic: PM almost empty while PF filled
+                if pm_s < max(1.0, target_net * 0.4) and pf_s >= target_net * 0.8:
+                    logger.error(
+                        "Hedge %s PM nearly empty (%.2f) while PF=%.2f — UNWIND both",
+                        hedge.id, pm_s, pf_s,
                     )
-                    if pf_s > target_match + 0.4:
-                        excess = round(pf_s - target_match, 4)
-                        try:
-                            bid, _ = self._pf_best(pf_m["id"], pf_dir)
-                            sell_px = max(0.01, round(float(bid or 0.01) - 0.02, 2))
-                            logger.warning(
-                                "Sell excess PF %.4f @ %.2f to match PM", excess, sell_px,
+                    try:
+                        if pm_s >= 0.5:
+                            bid, _ = self._pm_best(pm_dir)
+                            await self.pm.place_market_sell(
+                                str(pm_token), pm_s,
+                                max(0.01, round(float(bid or 0.01) - 0.02, 2)),
                             )
+                        if pf_s >= 0.5:
+                            bid, _ = self._pf_best(pf_m["id"], pf_dir)
                             await self.pf.place_order(
-                                pf_m["id"], "SELL", excess, sell_px,
+                                pf_m["id"], "SELL", pf_s,
+                                max(0.01, round(float(bid or 0.01) - 0.02, 2)),
                                 is_yes=(pf_dir == "up"),
                             )
-                            pf_s = target_match
-                            self._apply_fill(
-                                hedge.pf_leg,
-                                Fill(
-                                    status="FILLED",
-                                    shares=round(pf_s, 4),
-                                    price=float(hedge.pf_leg.entry_price or pf_fill.price or 0),
-                                    usd=round(pf_s * float(hedge.pf_leg.entry_price or pf_fill.price or 0), 4),
-                                    order_id=pf_fill.order_id,
-                                ),
-                            )
-                        except Exception as e:
-                            logger.error("Failed to sell excess PF: %s", e)
-                    if pm_s > target_match + 0.4:
-                        excess = round(pm_s - target_match, 4)
-                        try:
-                            bid, _ = self._pm_best(pm_dir)
-                            sell_px = max(0.01, round(float(bid or 0.01) - 0.02, 2))
-                            logger.warning(
-                                "Sell excess PM %.4f @ %.2f to match PF", excess, sell_px,
-                            )
-                            await self.pm.place_market_sell(str(pm_token), excess, sell_px)
-                            pm_s = target_match
-                            self._apply_fill(
-                                hedge.pm_leg,
-                                Fill(
-                                    status="FILLED",
-                                    shares=round(pm_s, 4),
-                                    price=float(hedge.pm_leg.entry_price or pm_fill.price or 0),
-                                    usd=round(pm_s * float(hedge.pm_leg.entry_price or pm_fill.price or 0), 4),
-                                    order_id=pm_fill.order_id,
-                                ),
-                            )
-                        except Exception as e:
-                            logger.error("Failed to sell excess PM: %s", e)
-                    # If still badly unbalanced (e.g. PM only 2.5 of 17), abort hedge:
-                    # sell both legs rather than hold naked exposure.
-                    pf_s = float(hedge.pf_leg.filled_shares or pf_s)
-                    pm_s = float(hedge.pm_leg.filled_shares or pm_s)
-                    if max(pf_s, pm_s) / max(min(pf_s, pm_s), 0.01) > 1.5:
-                        logger.error(
-                            "Hedge %s still unbalanced PF=%.2f PM=%.2f after match-down — UNWIND both",
-                            hedge.id, pf_s, pm_s,
-                        )
-                        try:
-                            if pm_s >= 0.5:
-                                bid, _ = self._pm_best(pm_dir)
-                                await self.pm.place_market_sell(
-                                    str(pm_token), pm_s,
-                                    max(0.01, round(float(bid or 0.01) - 0.02, 2)),
-                                )
-                            if pf_s >= 0.5:
-                                bid, _ = self._pf_best(pf_m["id"], pf_dir)
-                                await self.pf.place_order(
-                                    pf_m["id"], "SELL", pf_s,
-                                    max(0.01, round(float(bid or 0.01) - 0.02, 2)),
-                                    is_yes=(pf_dir == "up"),
-                                )
-                        except Exception as e:
-                            logger.error("Full unwind after imbalance failed: %s", e)
-                        hedge.status = "CLOSED"
-                        hedge.closed_at = time.time()
-                        self._entry_busy = False
-                        self.pf_entry_cooldown_until = time.time() + 15.0
-                        return
+                    except Exception as e:
+                        logger.error("Full unwind after imbalance failed: %s", e)
+                    hedge.status = "CLOSED"
+                    hedge.closed_at = time.time()
+                    self._entry_busy = False
+                    self.pf_entry_cooldown_until = time.time() + 15.0
+                    return
 
+            hedge.status = "OPEN"
+            self._entry_busy = False
             # Real entry sum from actual fill prices (not pre-trade quote sum)
             hedge.entry_sum = round(
                 float(hedge.pf_leg.entry_price or 0) + float(hedge.pm_leg.entry_price or 0), 4
             )
-            # Hard reject: no complete-set edge if entry_sum >= 0.95
-            if hedge.entry_sum >= 0.95:
-                logger.warning(
-                    "Hedge %s entry_sum=%.3f >= 0.95 after fill — UNWIND both (no lock edge)",
-                    hedge.id, hedge.entry_sum,
-                )
-                self._entry_busy = False
-                try:
-                    await self._unwind_pf_leg(hedge)
-                except Exception:
-                    pass
-                try:
-                    if float(hedge.pm_leg.filled_shares or 0) >= 0.5:
-                        bid, _ = self._pm_best(hedge.pm_leg.direction)
-                        await self.pm.place_market_sell(
-                            str(hedge.pm_leg.token_or_market),
-                            float(hedge.pm_leg.filled_shares),
-                            max(0.01, round(float(bid or 0.01) - 0.02, 2)),
-                        )
-                except Exception as e:
-                    logger.error("PM unwind after bad entry_sum: %s", e)
-                hedge.status = "CLOSED"
-                hedge.closed_at = time.time()
-                hedge.close_reason = "BAD_ENTRY"
-                return
-            hedge.status = "OPEN"
-            self._entry_busy = False
             logger.info(
-                "Hedge %s OPEN PF %.2f@%.3f + PM %.2f@%.3f entry_sum=%.3f",
+                "Hedge %s OPEN PF %.2f@%.3f + PM %.2f@%.3f entry_sum=%.3f target_net=%.2f",
                 hedge.id,
                 float(hedge.pf_leg.filled_shares or pf_fill.shares),
                 hedge.pf_leg.entry_price,
                 float(hedge.pm_leg.filled_shares or pm_fill.shares),
                 hedge.pm_leg.entry_price,
                 hedge.entry_sum,
+                target_net,
             )
+            # Place PF limit-sell of intentional excess at entry + offset
             try:
-                await self._place_pf_lock(hedge)
+                await self._place_pf_trim(hedge)
             except Exception as e:
-                logger.error("PF lock place after OPEN: %s", e)
+                logger.error("PF trim place failed: %s", e)
             # Re-pull real avg/shares from venues at T+30s and T+90s (API lag)
             try:
                 import asyncio as _aio
@@ -1352,6 +1335,182 @@ class HedgeEngine:
         elif fill.status == "SUBMITTED":
             leg.status = "SUBMITTED"
 
+    # ── PF trim (limit-sell intentional excess) ─────────────────
+
+    async def _place_pf_trim(self, hedge: Hedge) -> None:
+        """After entry: limit-sell PF excess so remaining ≈ target_net (= PM size).
+
+        Sell price = entry_price + pf_trim_offset (configurable, default +0.10).
+        Never places a second trim while one is already SUBMITTED/PARTIAL.
+        Size = min(configured extra, actual_pf - target_net, actual_pf - pm).
+        """
+        if hedge.pf_trim_status in ("SUBMITTED", "PARTIAL", "FILLED"):
+            return
+        if hedge.status not in ("OPEN", "PARTIAL"):
+            return
+
+        target = float(hedge.target_net or self.settings.base_shares or 6.0)
+        pf_sh = float(hedge.pf_leg.filled_shares or hedge.pf_leg.shares or 0)
+        pm_sh = float(hedge.pm_leg.filled_shares or hedge.pm_leg.shares or 0)
+        # Keep the smaller of (target_net, PM filled) as the desired remainder
+        keep = max(0.0, min(target, pm_sh) if pm_sh >= 0.5 else target)
+        excess = round(pf_sh - keep, 4)
+        # Cap to configured extra so we never sell past intentional oversize
+        max_extra = max(0.0, float(self.settings.pf_extra_shares or 0))
+        if max_extra > 0:
+            excess = min(excess, max_extra + 0.15)  # tiny slack for fill rounding
+        if excess < 0.4:
+            hedge.pf_trim_status = "SKIPPED"
+            logger.info(
+                "Hedge %s PF trim SKIPPED (excess=%.4f pf=%.4f keep=%.4f)",
+                hedge.id, excess, pf_sh, keep,
+            )
+            return
+
+        entry_px = float(hedge.pf_leg.entry_price or 0)
+        if entry_px <= 0:
+            hedge.pf_trim_status = "SKIPPED"
+            logger.warning("Hedge %s PF trim SKIPPED — no entry price", hedge.id)
+            return
+        offset = float(self.settings.pf_trim_offset or 0.10)
+        trim_px = min(0.99, max(0.01, round(entry_px + offset, 2)))
+        mid = str(hedge.pf_market_id or hedge.pf_leg.token_or_market)
+        is_yes = hedge.pf_leg.direction == "up"
+
+        # Cancel any previous open sells on this market to avoid duplicates
+        try:
+            await self.pf.cancel_all_open_orders(mid)
+        except Exception as e:
+            logger.debug("PF trim cancel_all before place: %s", e)
+
+        try:
+            resp = await self.pf.place_order(
+                mid, "SELL", excess, trim_px, is_yes=is_yes,
+            )
+        except Exception as e:
+            hedge.pf_trim_status = "FAILED"
+            logger.error("Hedge %s PF trim place error: %s", hedge.id, e)
+            return
+
+        oid = ""
+        if isinstance(resp, dict):
+            oid = str(
+                resp.get("orderId")
+                or resp.get("order_id")
+                or resp.get("id")
+                or (resp.get("data") or {}).get("orderId")
+                or (resp.get("data") or {}).get("id")
+                or ""
+            )
+        hedge.pf_trim_order_id = oid
+        hedge.pf_trim_shares = excess
+        hedge.pf_trim_target = excess
+        hedge.pf_trim_px = trim_px
+        hedge.pf_trim_status = "SUBMITTED"
+        hedge.pf_trim_filled = 0.0
+        hedge.pf_trim_proceeds = 0.0
+        logger.info(
+            "Hedge %s PF TRIM place SELL %.4f @ %.2f (entry=%.3f + %.2f) keep≈%.2f order=%s",
+            hedge.id, excess, trim_px, entry_px, offset, keep, (oid or "?")[:16],
+        )
+
+    async def _check_pf_trim(self, hedge: Hedge, now: float) -> None:
+        """Poll PF trim limit; on (partial) fill reduce tracked PF shares to remainder."""
+        if hedge.status not in ("OPEN", "PARTIAL", "CLOSING"):
+            return
+        if hedge.pf_trim_status not in ("SUBMITTED", "PARTIAL"):
+            return
+
+        target = float(hedge.target_net or self.settings.base_shares or 6.0)
+        mid = str(hedge.pf_market_id or hedge.pf_leg.token_or_market)
+        is_yes = hedge.pf_leg.direction == "up"
+        sold = float(hedge.pf_trim_filled or 0)
+        need = float(hedge.pf_trim_target or hedge.pf_trim_shares or 0)
+
+        # 1) Order status
+        if hedge.pf_trim_order_id:
+            try:
+                st = await self.pf.get_order(str(hedge.pf_trim_order_id))
+                if st:
+                    fill = fill_from_predict(st, need)
+                    matched = float(fill.shares or 0)
+                    if matched > sold + 0.01:
+                        delta = matched - sold
+                        px = float(fill.price or hedge.pf_trim_px or 0)
+                        hedge.pf_trim_filled = matched
+                        hedge.pf_trim_proceeds = round(
+                            float(hedge.pf_trim_proceeds or 0) + delta * px, 4,
+                        )
+                        sold = matched
+                        logger.info(
+                            "Hedge %s PF TRIM fill +%.4f (total sold=%.4f) @ %.3f",
+                            hedge.id, delta, sold, px,
+                        )
+                    if fill.status == "FILLED" or sold >= need * 0.95:
+                        hedge.pf_trim_status = "FILLED"
+            except Exception as e:
+                logger.debug("PF trim order poll: %s", e)
+
+        # 2) Position remainder as truth
+        try:
+            pos = await self.pf.get_position_for_market(mid, is_yes=is_yes)
+            live = float((pos or {}).get("shares") or 0)
+            if live > 0 or hedge.pf_trim_status == "FILLED":
+                # Update tracked shares to live remainder (never below 0)
+                old_sh = float(hedge.pf_leg.filled_shares or 0)
+                new_sh = max(0.0, live)
+                if abs(new_sh - old_sh) >= 0.05:
+                    # Adjust entry_usd: reduce by trim proceeds (fee-aware)
+                    old_usd = float(hedge.pf_leg.entry_usd or 0)
+                    proceeds = float(hedge.pf_trim_proceeds or 0)
+                    if proceeds > 0 and old_usd > 0:
+                        new_usd = max(0.0, old_usd - proceeds)
+                    elif old_sh > 0 and new_sh < old_sh:
+                        new_usd = old_usd * (new_sh / old_sh)
+                    else:
+                        new_usd = old_usd
+                    hedge.pf_leg.filled_shares = round(new_sh, 4)
+                    hedge.pf_leg.shares = round(new_sh, 4)
+                    hedge.pf_leg.entry_usd = round(new_usd, 4)
+                    if new_sh > 0 and new_usd > 0:
+                        # Keep original entry avg if we still hold; don't invent new avg
+                        pass
+                    logger.info(
+                        "Hedge %s PF trim reconcile shares %.4f→%.4f usd %.4f→%.4f "
+                        "(target_net=%.2f)",
+                        hedge.id, old_sh, new_sh, old_usd, new_usd, target,
+                    )
+                # Done when remainder within tolerance of target_net (or PM size)
+                pm_sh = float(hedge.pm_leg.filled_shares or 0)
+                keep = min(target, pm_sh) if pm_sh >= 0.5 else target
+                if live <= keep + 0.35 or hedge.pf_trim_status == "FILLED":
+                    if hedge.pf_trim_status != "FILLED":
+                        hedge.pf_trim_status = "FILLED"
+                    # Clamp display shares to keep if still slightly above
+                    if live > keep + 0.01 and live <= keep + 0.35:
+                        hedge.pf_leg.filled_shares = round(keep, 4)
+                        hedge.pf_leg.shares = round(keep, 4)
+                    logger.info(
+                        "Hedge %s PF TRIM done remain=%.4f target=%.2f sold=%.4f proceeds=$%.4f",
+                        hedge.id, float(hedge.pf_leg.filled_shares or 0), keep,
+                        float(hedge.pf_trim_filled or 0), float(hedge.pf_trim_proceeds or 0),
+                    )
+        except Exception as e:
+            logger.debug("PF trim position poll: %s", e)
+
+        # Heartbeat
+        last_hb = float(getattr(hedge, "_pf_trim_hb", 0) or 0)
+        if now - last_hb >= 20.0 and hedge.pf_trim_status in ("SUBMITTED", "PARTIAL"):
+            hedge._pf_trim_hb = now  # type: ignore[attr-defined]
+            logger.info(
+                "Hedge %s PF TRIM watching SELL %.2f @ %.2f sold=%.2f order=%s",
+                hedge.id,
+                float(hedge.pf_trim_target or 0),
+                float(hedge.pf_trim_px or 0),
+                float(hedge.pf_trim_filled or 0),
+                (hedge.pf_trim_order_id or "?")[:14],
+            )
+
     # ── manage open ─────────────────────────────────────────────
 
     async def _manage_open(self, now: float) -> None:
@@ -1360,6 +1519,19 @@ class HedgeEngine:
                 continue
             if hedge.status in ("OPENING", "PARTIAL"):
                 await self._retry_partial(hedge, now)
+            # Watch PF excess trim limit
+            if hedge.status in ("OPEN", "PARTIAL") and hedge.pf_trim_status in (
+                "SUBMITTED", "PARTIAL", "",
+            ):
+                if not hedge.pf_trim_status and float(hedge.pf_leg.filled_shares or 0) > 0:
+                    try:
+                        await self._place_pf_trim(hedge)
+                    except Exception as e:
+                        logger.debug("lazy PF trim place: %s", e)
+                try:
+                    await self._check_pf_trim(hedge, now)
+                except Exception as e:
+                    logger.debug("PF trim check: %s", e)
             # Past window end → settlement only (no more sells on dead markets)
             if hedge.status in ("OPEN", "PARTIAL", "CLOSING") and now >= hedge.market_end:
                 if hedge.status == "CLOSING":
@@ -1371,11 +1543,7 @@ class HedgeEngine:
                 await self._settle_pair(hedge, now)
                 continue
             if hedge.status == "OPEN":
-                # Primary exit: PF opposite-side lock fill → then sell PM
-                await self._check_pf_lock(hedge, now)
-                # Fallback: old EXIT_SUM path only if no lock is working
-                if hedge.status == "OPEN" and not hedge.pf_lock_order_id and not hedge.pf_lock_status:
-                    await self._try_exit(hedge, now)
+                await self._try_exit(hedge, now)
             if hedge.status == "CLOSING":
                 await self._finish_exit(hedge, now)
             if hedge.status == "SETTLING":
@@ -1733,16 +1901,15 @@ class HedgeEngine:
 
         if hedge.pf_leg.status == "FILLED" and hedge.pm_leg.status == "FILLED":
             self._refresh_entry_sum(hedge)
-            max_ok = min(0.94, float(self.settings.entry_sum_max) + 0.05)
+            max_ok = float(self.settings.entry_sum_max) + 0.05
             if hedge.entry_sum > max_ok:
                 logger.warning(
-                    "Hedge %s NOT promoting to OPEN: entry_sum=%.3f > %.3f — UNWIND",
+                    "Hedge %s NOT promoting to OPEN: entry_sum=%.3f > %.3f "
+                    "(PF %.2f@%.3f + PM %.2f@%.3f) — bad fill, keep PARTIAL",
                     hedge.id, hedge.entry_sum, max_ok,
+                    hedge.pf_leg.filled_shares, hedge.pf_leg.entry_price,
+                    hedge.pm_leg.filled_shares, hedge.pm_leg.entry_price,
                 )
-                try:
-                    await self._unwind_pf_leg(hedge)
-                except Exception as e:
-                    logger.error("unwind after bad promote: %s", e)
                 return
             pf_s = float(hedge.pf_leg.filled_shares or 0)
             pm_s = float(hedge.pm_leg.filled_shares or 0)
@@ -1753,6 +1920,10 @@ class HedgeEngine:
                 )
                 return
             hedge.status = "OPEN"
+            if not hedge.target_net:
+                hedge.target_net = float(
+                    hedge.pm_leg.filled_shares or self.settings.base_shares or 6.0
+                )
             logger.info(
                 "Hedge %s promoted PARTIAL→OPEN entry_sum=%.3f PF %.2f@%.3f PM %.2f@%.3f",
                 hedge.id, hedge.entry_sum,
@@ -1760,9 +1931,9 @@ class HedgeEngine:
                 hedge.pm_leg.filled_shares, hedge.pm_leg.entry_price,
             )
             try:
-                await self._place_pf_lock(hedge)
+                await self._place_pf_trim(hedge)
             except Exception as e:
-                logger.error("PF lock place after promote: %s", e)
+                logger.error("PF trim place after promote: %s", e)
             try:
                 import asyncio as _aio
                 _aio.create_task(self._delayed_reconcile(hedge, delays=(30.0, 90.0), phase="open"))
@@ -1810,15 +1981,26 @@ class HedgeEngine:
                 old_sh = float(hedge.pf_leg.filled_shares or 0)
                 # If live position is ~2x tracked, this is a double-fill on-chain.
                 # Adopt live size so PnL matches reality (do NOT ignore).
-                if old_sh > 0 and sh > old_sh * 1.5 and hedge.status in ("OPEN", "PARTIAL", "CLOSING", "SETTLING"):
+                # Intentional PF oversize (base+extra) is handled by limit trim —
+                # do not market-sell that planned excess as a "double-fill".
+                planned = float(hedge.target_net or 0) + float(self.settings.pf_extra_shares or 0)
+                if planned <= 0:
+                    planned = float(hedge.pf_leg.requested_shares or old_sh or 0)
+                if (
+                    old_sh > 0
+                    and sh > max(old_sh * 1.5, planned * 1.35)
+                    and hedge.status in ("OPEN", "PARTIAL", "CLOSING", "SETTLING")
+                ):
                     new_px = ap if 0.01 <= ap <= 1.0 else (cu / sh if sh else 0)
                     if not (0.01 <= new_px <= 1.0):
                         new_px = float(hedge.pf_leg.entry_price or 0) or 0.5
-                    # Target = PM filled size (or original tracked). Sell excess to rebalance.
-                    target = float(hedge.pm_leg.filled_shares or 0) or old_sh
+                    # Target = planned entry size (base+extra), not PM — trim handles rest
+                    target = planned if planned > 0 else (
+                        float(hedge.pm_leg.filled_shares or 0) or old_sh
+                    )
                     excess = max(0.0, sh - target)
                     logger.warning(
-                        "PF DOUBLE-FILL detected [%s] live=%.4f tracked=%.4f target=%.4f excess=%.4f",
+                        "PF DOUBLE-FILL detected [%s] live=%.4f tracked=%.4f planned=%.4f excess=%.4f",
                         reason, sh, old_sh, target, excess,
                     )
                     if excess >= 0.5 and hedge.status in ("OPEN", "PARTIAL") and not getattr(hedge, "_pf_excess_sold", False):
@@ -1949,346 +2131,6 @@ class HedgeEngine:
                 hedge.id, hedge.entry_sum,
                 hedge.pf_leg.entry_price, hedge.pm_leg.entry_price, reason,
             )
-
-    async def _place_pf_lock(self, hedge: Hedge) -> None:
-        """After both legs filled: rest PF limit on OPPOSITE side at 1-pf-pm.
-
-        Example: PF Down @0.41 + PM Up @0.33 → lock BUY Up @ 0.26 for same shares.
-        When lock fills we hold a complete PF set (~$1 redeem) and sell PM.
-        """
-        if hedge.pf_lock_status in ("SUBMITTED", "FILLED", "SKIPPED"):
-            return
-        pf_px = float(hedge.pf_leg.entry_price or 0)
-        pm_px = float(hedge.pm_leg.entry_price or 0)
-        if pf_px <= 0 or pm_px <= 0:
-            logger.warning("Hedge %s lock skip: missing entry prices pf=%.3f pm=%.3f", hedge.id, pf_px, pm_px)
-            hedge.pf_lock_status = "SKIPPED"
-            return
-        entry_sum = pf_px + pm_px
-        lock_px = round(1.0 - entry_sum, 2)
-        # Need meaningful room for complete-set edge (at least 5¢)
-        if lock_px < 0.05 or entry_sum >= 0.95:
-            logger.warning(
-                "Hedge %s lock SKIPPED px=%.2f entry_sum=%.3f — use settle only",
-                hedge.id, lock_px, entry_sum,
-            )
-            hedge.pf_lock_status = "SKIPPED"
-            hedge.pf_lock_px = max(0.0, lock_px)
-            return
-        lock_px = max(0.05, min(0.95, lock_px))
-        shares = min(
-            float(hedge.pf_leg.filled_shares or 0),
-            float(hedge.pm_leg.filled_shares or 0),
-        )
-        shares = round(shares, 4)
-        if shares < 0.5:
-            hedge.pf_lock_status = "SKIPPED"
-            return
-        lock_dir = "down" if hedge.pf_leg.direction == "up" else "up"
-        mid = str(hedge.pf_market_id or hedge.pf_leg.token_or_market)
-        hedge.pf_lock_dir = lock_dir
-        hedge.pf_lock_px = lock_px
-        hedge.pf_lock_shares = shares
-
-        # Snapshot opposite-side position BEFORE placing (must not count entry leg)
-        pre_opp = 0.0
-        try:
-            pos0 = await self.pf.get_position_for_market(mid, is_yes=(lock_dir == "up"))
-            if pos0:
-                pre_opp = float(pos0.get("shares") or 0)
-                # Guard: if API returned entry-leg size as opposite, ignore
-                entry_sh = float(hedge.pf_leg.filled_shares or 0)
-                avg0 = float(pos0.get("avg_price") or 0)
-                entry_px = float(hedge.pf_leg.entry_price or 0)
-                if (
-                    entry_sh > 0
-                    and abs(pre_opp - entry_sh) < 0.3
-                    and avg0 > 0
-                    and entry_px > 0
-                    and abs(avg0 - entry_px) < 0.08
-                ):
-                    logger.warning(
-                        "Hedge %s pre_opp=%.4f looks like ENTRY leg (avg=%.3f≈%.3f) — force 0",
-                        hedge.id, pre_opp, avg0, entry_px,
-                    )
-                    pre_opp = 0.0
-        except Exception:
-            pre_opp = 0.0
-        hedge._pf_lock_pre_opp = pre_opp  # type: ignore[attr-defined]
-
-        logger.info(
-            "Hedge %s PF LOCK place BUY %s %.4f sh @ %.2f "
-            "(1 - pf@%.3f - pm@%.3f) market=%s pre_opp=%.4f",
-            hedge.id, lock_dir.upper(), shares, lock_px, pf_px, pm_px, mid, pre_opp,
-        )
-        try:
-            resp = await self.pf.place_order(
-                mid, "BUY", shares, lock_px, is_yes=(lock_dir == "up"),
-            )
-        except Exception as e:
-            logger.error("Hedge %s PF lock place_order failed: %s", hedge.id, e)
-            hedge.pf_lock_status = "FAILED"
-            return
-        oid = ""
-        if isinstance(resp, dict):
-            oid = str(
-                resp.get("orderId")
-                or resp.get("order_id")
-                or resp.get("id")
-                or (resp.get("data") or {}).get("id")
-                or ""
-            )
-            st = str(resp.get("status") or "").upper()
-            filled = float(
-                resp.get("filledShares")
-                or resp.get("filled_shares")
-                or resp.get("sizeMatched")
-                or 0
-            )
-            # Only trust immediate fill from order response sizeMatched, not position API
-            if filled >= shares * 0.9 and st in ("FILLED", "MATCHED", "CLOSED"):
-                hedge.pf_lock_status = "FILLED"
-                hedge.pf_lock_filled_shares = filled or shares
-                hedge.pf_lock_entry_usd = round((filled or shares) * lock_px, 4)
-                hedge.pf_lock_order_id = oid
-                logger.info(
-                    "Hedge %s PF LOCK filled immediately via order resp %.4f @ %.2f",
-                    hedge.id, hedge.pf_lock_filled_shares, lock_px,
-                )
-                await self._complete_lock_exit(hedge)
-                return
-        hedge.pf_lock_order_id = oid
-        hedge.pf_lock_status = "SUBMITTED"
-        logger.info(
-            "Hedge %s PF LOCK resting order=%s %s @ %.2f × %.4f",
-            hedge.id, (oid or "?")[:18], lock_dir.upper(), lock_px, shares,
-        )
-
-    async def _check_pf_lock(self, hedge: Hedge, now: float) -> None:
-        """Poll resting PF lock; on fill → sell PM and close hedge with real PnL."""
-        if hedge.status != "OPEN":
-            return
-        if hedge.pf_lock_status == "SKIPPED":
-            return
-        if not hedge.pf_lock_status and not hedge.pf_lock_order_id:
-            if float(hedge.pf_leg.entry_price or 0) > 0 and float(hedge.pm_leg.entry_price or 0) > 0:
-                await self._place_pf_lock(hedge)
-            return
-        if hedge.pf_lock_status == "FILLED":
-            await self._complete_lock_exit(hedge)
-            return
-        if hedge.pf_lock_status not in ("SUBMITTED", "FAILED"):
-            return
-
-        # Heartbeat so dashboard/logs show lock is being watched
-        last_hb = float(getattr(hedge, "_pf_lock_hb", 0) or 0)
-        if now - last_hb >= 15.0:
-            hedge._pf_lock_hb = now  # type: ignore[attr-defined]
-            logger.info(
-                "Hedge %s PF LOCK watching %s @ %.2f × %.2f order=%s (ends_in=%ds)",
-                hedge.id,
-                (hedge.pf_lock_dir or "?").upper(),
-                float(hedge.pf_lock_px or 0),
-                float(hedge.pf_lock_shares or 0),
-                (hedge.pf_lock_order_id or "?")[:14],
-                max(0, int(hedge.market_end - now)),
-            )
-
-        mid = str(hedge.pf_market_id or hedge.pf_leg.token_or_market)
-        lock_dir = hedge.pf_lock_dir or ("down" if hedge.pf_leg.direction == "up" else "up")
-        need = float(hedge.pf_lock_shares or hedge.pf_leg.filled_shares or 0)
-        lock_px = float(hedge.pf_lock_px or 0)
-        pre_opp = float(getattr(hedge, "_pf_lock_pre_opp", 0) or 0)
-        filled = 0.0
-        avg = lock_px
-
-        # 1) Order status first (preferred — don't use entry-leg position)
-        if hedge.pf_lock_order_id:
-            try:
-                st = await self.pf.get_order(str(hedge.pf_lock_order_id))
-                if st and isinstance(st, dict):
-                    got = float(
-                        st.get("filledShares")
-                        or st.get("filled_shares")
-                        or st.get("sizeMatched")
-                        or st.get("filled_size")
-                        or 0
-                    )
-                    if got > 0:
-                        filled = got
-                    px = float(st.get("avgPrice") or st.get("avg_price") or st.get("price") or 0)
-                    if 0.01 <= px <= 1.0:
-                        avg = px
-                    status = str(st.get("status") or "").upper()
-                    if status in ("CANCELLED", "CANCELED", "EXPIRED"):
-                        if now < hedge.market_end - 20 and not getattr(hedge, "_pf_lock_replaced", False):
-                            hedge._pf_lock_replaced = True  # type: ignore[attr-defined]
-                            logger.warning("Hedge %s PF LOCK cancelled — one re-place", hedge.id)
-                            hedge.pf_lock_status = ""
-                            hedge.pf_lock_order_id = ""
-                            await self._place_pf_lock(hedge)
-                        else:
-                            hedge.pf_lock_status = "SKIPPED"
-                        return
-                    if status in ("FILLED", "MATCHED", "CLOSED") and filled >= need * 0.85:
-                        pass  # filled set above
-            except Exception as e:
-                logger.debug("PF lock get_order: %s", e)
-
-        # 2) Position on OPPOSITE side only — must be NEW shares beyond pre_opp
-        #    and avg price near lock_px (not entry leg price ~0.50 when lock is 0.11)
-        if filled < need * 0.85:
-            try:
-                pos = await self.pf.get_position_for_market(mid, is_yes=(lock_dir == "up"))
-                if pos:
-                    live = float(pos.get("shares") or 0)
-                    live_avg = float(pos.get("avg_price") or 0)
-                    delta = live - pre_opp
-                    # Accept only if we gained shares AND avg is near lock (not entry)
-                    near_lock = (
-                        lock_px > 0
-                        and live_avg > 0
-                        and abs(live_avg - lock_px) <= 0.08
-                    )
-                    # Or avg is clearly on the lock side of 0.5 vs entry
-                    entry_px = float(hedge.pf_leg.entry_price or 0)
-                    not_entry = live_avg > 0 and abs(live_avg - entry_px) > 0.08
-                    if delta >= need * 0.85 and (near_lock or (not_entry and live_avg <= lock_px + 0.05)):
-                        filled = delta
-                        avg = live_avg if live_avg > 0 else lock_px
-                        logger.info(
-                            "Hedge %s PF LOCK pos delta=%.4f avg=%.4f (pre=%.4f lock=%.2f)",
-                            hedge.id, delta, avg, pre_opp, lock_px,
-                        )
-                    elif delta >= need * 0.5:
-                        logger.debug(
-                            "Hedge %s PF LOCK pos delta=%.4f avg=%.4f ignored "
-                            "(need near lock_px=%.2f, entry was %.3f)",
-                            hedge.id, delta, live_avg, lock_px, entry_px,
-                        )
-            except Exception as e:
-                logger.debug("PF lock position poll: %s", e)
-
-        if filled >= max(0.5, need * 0.85):
-            # Final safety: reject if avg looks like entry price, not lock
-            entry_px = float(hedge.pf_leg.entry_price or 0)
-            if avg > 0 and entry_px > 0 and abs(avg - entry_px) < 0.05 and abs(avg - lock_px) > 0.08:
-                logger.warning(
-                    "Hedge %s PF LOCK false-fill rejected avg=%.3f≈entry=%.3f lock=%.2f",
-                    hedge.id, avg, entry_px, lock_px,
-                )
-                return
-            hedge.pf_lock_status = "FILLED"
-            hedge.pf_lock_filled_shares = round(filled, 4)
-            if avg <= 0:
-                avg = lock_px
-            hedge.pf_lock_entry_usd = round(filled * avg, 4)
-            logger.info(
-                "Hedge %s PF LOCK FILLED %.4f @ %.4f (need=%.4f lock=%.2f) — sell PM",
-                hedge.id, filled, avg, need, lock_px,
-            )
-            await self._complete_lock_exit(hedge)
-
-    async def _complete_lock_exit(self, hedge: Hedge) -> None:
-        """Lock filled → sell PM leg, compute PnL from complete-set + PM exit."""
-        if hedge.status in ("CLOSING", "CLOSED", "SETTLING"):
-            return
-        hedge.status = "CLOSING"
-        hedge.close_reason = "LOCK"
-        sh = min(
-            float(hedge.pf_leg.filled_shares or 0),
-            float(hedge.pm_leg.filled_shares or 0),
-            float(hedge.pf_lock_filled_shares or hedge.pf_lock_shares or 0) or 1e9,
-        )
-        sh = round(sh, 4)
-        pf_entry_usd = float(hedge.pf_leg.entry_usd or 0) or (
-            float(hedge.pf_leg.filled_shares or 0) * float(hedge.pf_leg.entry_price or 0)
-        )
-        lock_usd = float(hedge.pf_lock_entry_usd or 0) or (
-            float(hedge.pf_lock_filled_shares or 0) * float(hedge.pf_lock_px or 0)
-        )
-        # Complete set on PF redeems ~$1 per share
-        pf_redeem = round(sh * 1.0, 4)
-        pf_pnl = round(pf_redeem - pf_entry_usd - lock_usd, 4)
-
-        # Sell PM
-        pm_sh = float(hedge.pm_leg.filled_shares or 0)
-        try:
-            bal = await self.pm.get_token_balance(str(hedge.pm_leg.token_or_market))
-            if bal and float(bal) > 0.1:
-                pm_sh = float(bal)
-        except Exception:
-            pass
-        bid, _ = self._pm_best(hedge.pm_leg.direction)
-        sell_px = max(0.01, round(float(bid or 0.01) - 0.01, 2))
-        logger.info(
-            "Hedge %s LOCK exit: sell PM %.4f @~%.2f (bid=%.3f) | "
-            "PF set redeem~$%.2f cost=%.2f+%.2f → pf_pnl=%.2f",
-            hedge.id, pm_sh, sell_px, float(bid or 0),
-            pf_redeem, pf_entry_usd, lock_usd, pf_pnl,
-        )
-        pm_exit_usd = 0.0
-        pm_exit_px = 0.0
-        try:
-            resp = await self.pm.place_market_sell(
-                str(hedge.pm_leg.token_or_market), pm_sh, sell_px,
-            )
-            # Parse sell proceeds if present
-            if isinstance(resp, dict):
-                taking = float(resp.get("takingAmount") or resp.get("makingAmount") or 0)
-                # For SELL: makingAmount often = shares, takingAmount = USDC
-                if resp.get("takingAmount") is not None:
-                    try:
-                        pm_exit_usd = float(resp["takingAmount"])
-                    except Exception:
-                        pm_exit_usd = 0.0
-                if pm_exit_usd <= 0 and taking > 0 and taking < pm_sh:
-                    pm_exit_usd = taking
-                if pm_exit_usd <= 0:
-                    pm_exit_usd = round(pm_sh * sell_px, 4)
-                pm_exit_px = round(pm_exit_usd / pm_sh, 4) if pm_sh > 0 else sell_px
-            else:
-                pm_exit_usd = round(pm_sh * sell_px, 4)
-                pm_exit_px = sell_px
-        except Exception as e:
-            logger.error("Hedge %s PM sell after lock failed: %s", hedge.id, e)
-            pm_exit_usd = round(pm_sh * sell_px, 4)
-            pm_exit_px = sell_px
-
-        hedge.pm_leg.exit_price = pm_exit_px
-        hedge.pm_leg.exit_usd = pm_exit_usd
-        hedge.pm_leg.status = "CLOSED"
-        # PF: mark both entry leg and lock as closed via set value
-        hedge.pf_leg.exit_price = 1.0  # complete-set unit value (paired with lock)
-        hedge.pf_leg.exit_usd = pf_redeem
-        hedge.pf_leg.status = "CLOSED"
-
-        pm_entry_usd = float(hedge.pm_leg.entry_usd or 0) or (
-            float(hedge.pm_leg.filled_shares or 0) * float(hedge.pm_leg.entry_price or 0)
-        )
-        pm_pnl = round(pm_exit_usd - pm_entry_usd, 4)
-        total = round(pf_pnl + pm_pnl, 4)
-        hedge.pnl = total
-        hedge.exit_sum = round(
-            float(hedge.pf_leg.entry_price or 0)
-            + float(hedge.pf_lock_px or 0)
-            + float(pm_exit_px or 0),
-            4,
-        )
-        hedge.status = "CLOSED"
-        hedge.closed_at = time.time()
-        logger.info(
-            "Hedge %s LOCK CLOSED pf_pnl=%.4f (redeem=%.2f - entry=%.2f - lock=%.2f) "
-            "pm_pnl=%.4f (exit=%.2f - entry=%.2f) total=%.4f",
-            hedge.id, pf_pnl, pf_redeem, pf_entry_usd, lock_usd,
-            pm_pnl, pm_exit_usd, pm_entry_usd, total,
-        )
-        try:
-            self.recovery.on_pair_closed(
-                hedge.id, pf_pnl, pm_pnl, 0.0, sh,
-            )
-        except Exception as e:
-            logger.warning("recovery on lock exit: %s", e)
 
     async def _try_exit(self, hedge: Hedge, now: float) -> None:
         """Early exit when sum of bids >= exit_sum_min AND beats entry (sell both).
@@ -2440,6 +2282,10 @@ class HedgeEngine:
             logger.warning("recovery on unwind: %s", e)
 
     async def _sell_both(self, hedge: Hedge) -> None:
+        try:
+            await self._cancel_pf_trim(hedge, reason="exit")
+        except Exception:
+            pass
         await asyncio.gather(
             self._sell_leg(hedge.pf_leg, "PF"),
             self._sell_leg(hedge.pm_leg, "PM"),
@@ -2776,6 +2622,32 @@ class HedgeEngine:
                     hedge.id, old, hedge.entry_sum, pf_px, pm_px,
                 )
 
+    async def _cancel_pf_trim(self, hedge: Hedge, reason: str = "") -> None:
+        """Cancel resting PF excess-sell before exit/settle. Reconcile fills once."""
+        if hedge.pf_trim_status not in ("SUBMITTED", "PARTIAL"):
+            return
+        try:
+            await self._check_pf_trim(hedge, time.time())
+        except Exception:
+            pass
+        if hedge.pf_trim_order_id and hedge.pf_trim_status in ("SUBMITTED", "PARTIAL"):
+            try:
+                await self.pf.cancel_order(str(hedge.pf_trim_order_id))
+                logger.info(
+                    "Hedge %s PF TRIM cancel (%s) order=%s sold=%.4f",
+                    hedge.id, reason or "exit",
+                    str(hedge.pf_trim_order_id)[:16],
+                    float(hedge.pf_trim_filled or 0),
+                )
+            except Exception as e:
+                logger.debug("PF trim cancel: %s", e)
+            hedge.pf_trim_status = "CANCELLED"
+        try:
+            mid = str(hedge.pf_market_id or hedge.pf_leg.token_or_market)
+            await self.pf.cancel_all_open_orders(mid)
+        except Exception:
+            pass
+
     async def _settle_pair(self, hedge: Hedge, now: float) -> None:
         """Settle each leg from **venue resolution**, not mid-price guess.
 
@@ -2785,66 +2657,11 @@ class HedgeEngine:
         if now < hedge.market_end:
             return
 
-        # If lock filled (even in last seconds), sell PM instead of settling naked
-        if hedge.pf_lock_status in ("SUBMITTED", "FILLED", ""):
-            try:
-                await self._check_pf_lock(hedge, now)
-            except Exception as e:
-                logger.debug("settle-time lock check: %s", e)
-        if hedge.pf_lock_status == "FILLED" and hedge.status != "CLOSED":
-            try:
-                await self._complete_lock_exit(hedge)
-            except Exception as e:
-                logger.error("settle-time lock exit: %s", e)
-        if hedge.status == "CLOSED":
-            return
-
-        # Before cancel: one more opposite-side position check
-        if hedge.pf_lock_status == "SUBMITTED":
-            try:
-                mid = str(hedge.pf_market_id or hedge.pf_leg.token_or_market)
-                lock_dir = hedge.pf_lock_dir or (
-                    "down" if hedge.pf_leg.direction == "up" else "up"
-                )
-                pos = await self.pf.get_position_for_market(
-                    mid, is_yes=(lock_dir == "up"),
-                )
-                pre = float(getattr(hedge, "_pf_lock_pre_opp", 0) or 0)
-                live = float((pos or {}).get("shares") or 0)
-                need = float(hedge.pf_lock_shares or 0)
-                delta = live - pre
-                if delta >= max(0.5, need * 0.7):
-                    avg = float((pos or {}).get("avg_price") or hedge.pf_lock_px or 0)
-                    hedge.pf_lock_status = "FILLED"
-                    hedge.pf_lock_filled_shares = round(delta, 4)
-                    hedge.pf_lock_entry_usd = round(
-                        delta * (avg or float(hedge.pf_lock_px or 0)), 4,
-                    )
-                    logger.info(
-                        "Hedge %s settle: lock WAS filled delta=%.4f — sell PM",
-                        hedge.id, delta,
-                    )
-                    await self._complete_lock_exit(hedge)
-                    if hedge.status == "CLOSED":
-                        return
-            except Exception as e:
-                logger.debug("settle lock pos check: %s", e)
-
-        if hedge.pf_lock_status == "SUBMITTED" and hedge.pf_lock_order_id:
-            try:
-                await self.pf.cancel_order(str(hedge.pf_lock_order_id))
-                logger.info(
-                    "Hedge %s settle: cancel resting PF lock %s",
-                    hedge.id, str(hedge.pf_lock_order_id)[:18],
-                )
-                hedge.pf_lock_status = "CANCELLED"
-            except Exception as e:
-                logger.debug("cancel PF lock on settle: %s", e)
-            try:
-                mid = str(hedge.pf_market_id or hedge.pf_leg.token_or_market)
-                await self.pf.cancel_all_open_orders(mid)
-            except Exception:
-                pass
+        # Final trim check + cancel so we don't leave resting sells into resolution
+        try:
+            await self._cancel_pf_trim(hedge, reason="settle")
+        except Exception as e:
+            logger.debug("settle trim cleanup: %s", e)
 
         wait_s = now - float(hedge.market_end or now)
         pf_up_won: bool | None = None
@@ -3181,27 +2998,20 @@ class HedgeEngine:
                 "entry_sum": h.entry_sum,
                 "exit_sum": h.exit_sum,
                 "pnl": h.pnl,
-                "close_reason": h.close_reason,
                 "bn": leg_snap(h.pf_leg),  # UI still uses bn column for Predict leg
                 "pf": leg_snap(h.pf_leg),
                 "pm": leg_snap(h.pm_leg),
                 "opened_at": h.opened_at,
                 "market_end": h.market_end,
                 "slug": slug,
-                "lock": {
-                    "dir": h.pf_lock_dir,
-                    "px": h.pf_lock_px,
-                    "shares": h.pf_lock_shares,
-                    "status": h.pf_lock_status,
-                    "filled": h.pf_lock_filled_shares,
-                    "order_id": (h.pf_lock_order_id or "")[:18],
-                    "formula": (
-                        f"1-{float(h.pf_leg.entry_price or 0):.2f}"
-                        f"-{float(h.pm_leg.entry_price or 0):.2f}"
-                        f"={float(h.pf_lock_px or 0):.2f}"
-                        if h.pf_lock_px
-                        else ""
-                    ),
+                "target_net": h.target_net,
+                "pf_trim": {
+                    "status": h.pf_trim_status,
+                    "px": h.pf_trim_px,
+                    "target": h.pf_trim_target,
+                    "filled": h.pf_trim_filled,
+                    "proceeds": h.pf_trim_proceeds,
+                    "order_id": (h.pf_trim_order_id or "")[:18],
                 },
             }
             if h.status in ("CLOSED",):
@@ -3217,6 +3027,9 @@ class HedgeEngine:
             "settings": {
                 "entry_sum_max": self.settings.entry_sum_max,
                 "exit_sum_min": self.settings.exit_sum_min,
+                "base_shares": self.settings.base_shares,
+                "pf_extra_shares": self.settings.pf_extra_shares,
+                "pf_trim_offset": self.settings.pf_trim_offset,
             },
             "recovery": self.recovery.snapshot(),
             "realized_pnl": sum(h.pnl for h in self.hedges if h.status == "CLOSED"),

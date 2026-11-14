@@ -5,7 +5,6 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -33,6 +32,13 @@ class Settings(BaseSettings):
     min_time_to_expiry_sec: int = 60
     leg_retry_sec: float = 3.0
     leg_retry_max: int = 5
+
+    # PF oversized entry + limit trim of excess
+    # Buy (base + pf_extra_shares) on Predict, base on Polymarket.
+    # Immediately place PF limit SELL for the excess at entry + pf_trim_offset.
+    # Example: base=6, extra=4 → PF 10 / PM 6; sell 4 @ entry+0.10.
+    pf_extra_shares: float = 4.0
+    pf_trim_offset: float = 0.10
 
     # Predict.fun
     predict_api_key: str = ""
