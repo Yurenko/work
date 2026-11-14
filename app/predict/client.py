@@ -570,15 +570,32 @@ class PredictClient:
             if not isinstance(row, dict):
                 continue
             if is_yes is not None:
-                # Filter by outcome / isYes / outcomeName
+                # Filter by outcome / isYes / outcomeName / indexSet
+                # If side cannot be determined — SKIP (do NOT treat as match).
+                # Bug: accepting unknown side returned ENTRY Up shares as Down
+                # and set pre_opp=entry → lock fill delta always 0.
                 row_yes = row.get("isYes")
                 if row_yes is None:
-                    name = str(row.get("outcome") or row.get("outcomeName") or row.get("name") or "").lower()
+                    name = str(
+                        row.get("outcome")
+                        or row.get("outcomeName")
+                        or row.get("name")
+                        or row.get("title")
+                        or ""
+                    ).lower()
                     if name in ("yes", "up"):
                         row_yes = True
                     elif name in ("no", "down"):
                         row_yes = False
-                if row_yes is not None and bool(row_yes) != bool(is_yes):
+                    else:
+                        idx = row.get("indexSet") or row.get("outcomeIndex") or row.get("outcome_index")
+                        if idx in (1, "1", 0, "0"):
+                            row_yes = True
+                        elif idx in (2, "2"):
+                            row_yes = False
+                if row_yes is None:
+                    continue  # unknown side → skip
+                if bool(row_yes) != bool(is_yes):
                     continue
             raw = row.get("amount") or 0
             try:

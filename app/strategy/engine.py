@@ -1996,6 +1996,22 @@ class HedgeEngine:
             pos0 = await self.pf.get_position_for_market(mid, is_yes=(lock_dir == "up"))
             if pos0:
                 pre_opp = float(pos0.get("shares") or 0)
+                # Guard: if API returned entry-leg size as opposite, ignore
+                entry_sh = float(hedge.pf_leg.filled_shares or 0)
+                avg0 = float(pos0.get("avg_price") or 0)
+                entry_px = float(hedge.pf_leg.entry_price or 0)
+                if (
+                    entry_sh > 0
+                    and abs(pre_opp - entry_sh) < 0.3
+                    and avg0 > 0
+                    and entry_px > 0
+                    and abs(avg0 - entry_px) < 0.08
+                ):
+                    logger.warning(
+                        "Hedge %s pre_opp=%.4f looks like ENTRY leg (avg=%.3f≈%.3f) — force 0",
+                        hedge.id, pre_opp, avg0, entry_px,
+                    )
+                    pre_opp = 0.0
         except Exception:
             pre_opp = 0.0
         hedge._pf_lock_pre_opp = pre_opp  # type: ignore[attr-defined]
@@ -2063,6 +2079,20 @@ class HedgeEngine:
             return
         if hedge.pf_lock_status not in ("SUBMITTED", "FAILED"):
             return
+
+        # Heartbeat so dashboard/logs show lock is being watched
+        last_hb = float(getattr(hedge, "_pf_lock_hb", 0) or 0)
+        if now - last_hb >= 15.0:
+            hedge._pf_lock_hb = now  # type: ignore[attr-defined]
+            logger.info(
+                "Hedge %s PF LOCK watching %s @ %.2f × %.2f order=%s (ends_in=%ds)",
+                hedge.id,
+                (hedge.pf_lock_dir or "?").upper(),
+                float(hedge.pf_lock_px or 0),
+                float(hedge.pf_lock_shares or 0),
+                (hedge.pf_lock_order_id or "?")[:14],
+                max(0, int(hedge.market_end - now)),
+            )
 
         mid = str(hedge.pf_market_id or hedge.pf_leg.token_or_market)
         lock_dir = hedge.pf_lock_dir or ("down" if hedge.pf_leg.direction == "up" else "up")
@@ -2755,7 +2785,51 @@ class HedgeEngine:
         if now < hedge.market_end:
             return
 
-        # Cancel resting PF lock — market ended, no more complete-set exit
+        # If lock filled (even in last seconds), sell PM instead of settling naked
+        if hedge.pf_lock_status in ("SUBMITTED", "FILLED", ""):
+            try:
+                await self._check_pf_lock(hedge, now)
+            except Exception as e:
+                logger.debug("settle-time lock check: %s", e)
+        if hedge.pf_lock_status == "FILLED" and hedge.status != "CLOSED":
+            try:
+                await self._complete_lock_exit(hedge)
+            except Exception as e:
+                logger.error("settle-time lock exit: %s", e)
+        if hedge.status == "CLOSED":
+            return
+
+        # Before cancel: one more opposite-side position check
+        if hedge.pf_lock_status == "SUBMITTED":
+            try:
+                mid = str(hedge.pf_market_id or hedge.pf_leg.token_or_market)
+                lock_dir = hedge.pf_lock_dir or (
+                    "down" if hedge.pf_leg.direction == "up" else "up"
+                )
+                pos = await self.pf.get_position_for_market(
+                    mid, is_yes=(lock_dir == "up"),
+                )
+                pre = float(getattr(hedge, "_pf_lock_pre_opp", 0) or 0)
+                live = float((pos or {}).get("shares") or 0)
+                need = float(hedge.pf_lock_shares or 0)
+                delta = live - pre
+                if delta >= max(0.5, need * 0.7):
+                    avg = float((pos or {}).get("avg_price") or hedge.pf_lock_px or 0)
+                    hedge.pf_lock_status = "FILLED"
+                    hedge.pf_lock_filled_shares = round(delta, 4)
+                    hedge.pf_lock_entry_usd = round(
+                        delta * (avg or float(hedge.pf_lock_px or 0)), 4,
+                    )
+                    logger.info(
+                        "Hedge %s settle: lock WAS filled delta=%.4f — sell PM",
+                        hedge.id, delta,
+                    )
+                    await self._complete_lock_exit(hedge)
+                    if hedge.status == "CLOSED":
+                        return
+            except Exception as e:
+                logger.debug("settle lock pos check: %s", e)
+
         if hedge.pf_lock_status == "SUBMITTED" and hedge.pf_lock_order_id:
             try:
                 await self.pf.cancel_order(str(hedge.pf_lock_order_id))
