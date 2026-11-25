@@ -611,6 +611,11 @@ class HedgeEngine:
             return
         if now - self._last_entry_attempt < 1.0:
             return
+        if self._step_result_pending():
+            # The recovery position is still settling. Its candle is not the
+            # result: that guess posted 294 shares one second before +$73.50.
+            self.status_text = "waiting for settlement before the recovery limit"
+            return
         self._last_entry_attempt = now
         side = self.recovery.order_side()
         if side not in ("up", "down"):
@@ -791,6 +796,53 @@ class HedgeEngine:
                 leg.status = "WAITING"
             await self._buy_recovery_leg(hedge, venue, ask)
         self._note_recovery_positions(hedge)
+
+    def _step_result_pending(self) -> bool:
+        """A step recovery position is waiting for the official dollar result."""
+        for hedge in self.hedges:
+            if hedge.status != "SETTLING":
+                continue
+            if (
+                getattr(hedge, "strategy_mode", "") == "RECOVERY"
+                or float(getattr(hedge, "limit_ceiling", 0) or 0) > 0
+            ):
+                return True
+        return False
+
+    async def _drop_unfilled_step_limits(self) -> None:
+        """A plus ends recovery. A resting 0.50 limit from before that plus must go.
+
+        Cancelling does not skip another market. The position never filled,
+        so it is not a loss and it does not change the share ladder.
+        """
+        if self.trade_strategy != "step" or self.recovery.mode == "RECOVERY":
+            return
+        for hedge in list(self.hedges):
+            if hedge.status == "CLOSED" or not self._step_limit_unfilled(hedge):
+                continue
+            for venue, leg in (("pf", hedge.pf_leg), ("pm", hedge.pm_leg)):
+                order_id = str(leg.order_id or "")
+                if not order_id or order_id.startswith("paper-rest") or not self.settings.is_live:
+                    continue
+                try:
+                    if venue == "pf":
+                        await self.pf.cancel_order(order_id)
+                    else:
+                        await self.pm.cancel_order(order_id)
+                except Exception as exc:
+                    logger.warning("step limit cancel %s %s: %s", hedge.id, venue, exc)
+            hedge.status = "CLOSED"
+            hedge.closed_at = time.time()
+            hedge.close_reason = "CANCELLED"
+            try:
+                self.hedges.remove(hedge)
+            except ValueError:
+                pass
+            self.trade_history.upsert(row_from_hedge(hedge))
+            logger.info(
+                "Hedge %s step limit cancelled — settlement was a plus, hedging stays on",
+                hedge.id,
+            )
 
     def _step_limit_unfilled(self, hedge: Hedge) -> bool:
         if float(getattr(hedge, "limit_ceiling", 0) or 0) <= 0:
@@ -3743,6 +3795,7 @@ class HedgeEngine:
         hedge.status = "CLOSED"
         hedge.closed_at = now
         self._apply_cycle_result(hedge, pf_pnl, pm_pnl, hedge.pf_leg.filled_shares or 0)
+        await self._drop_unfilled_step_limits()
         logger.info(
             "Hedge %s SETTLE pf_up=%s pm_up=%s pf=%s@%.3f→%.3f($%.2f) pm=%s@%.3f→%.3f($%.2f) pnl=%.4f",
             hedge.id,
@@ -4037,6 +4090,12 @@ class HedgeEngine:
         previous window's BTC close versus its open is the same signal.
         """
         if getattr(hedge, "_next_entry_decided", False):
+            return
+        if self.trade_strategy == "step":
+            # Step recovery changes size only from the official combined PnL.
+            # The previous candle is not that result: it placed a 294-share
+            # limit one second before a +$73.50 settlement, and the limit
+            # stayed after the mode returned to hedging.
             return
         held = self._opened_recovery_side(hedge) or self._unhedged_side(hedge)
         decision = recovery_entry_decision(held, pf_up_won, pm_up_won)
