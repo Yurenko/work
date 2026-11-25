@@ -12,11 +12,16 @@ import httpx
 
 from app.core.config import get_settings
 from app.core.logging import logger
+from app.polymarket.dns import install as install_public_dns
 from app.polymarket.markets import parse_updown_market, updown_slug, resolved_updown
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+# Public price-to-beat used by the BTC 5m page. variant=fiveminute is required;
+# any other variant silently falls back to a different series.
+CRYPTO_PRICE_URL = "https://polymarket.com/api/crypto/crypto-price"
+CHAINLINK_CANDLES_URL = "https://polymarket.com/api/chainlink-candles"
 
 
 def _f(value: Any) -> Optional[float]:
@@ -60,15 +65,12 @@ def _quantize_buy_size(size: float, limit: float) -> float:
 def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float]:
     """Share-sized BUY for Polymarket CLOB.
 
-    Default: size ≈ target_shares (equal to PF), quantized for CLOB rules.
-    Only if notional < $1.05 (cheap ask), bump size so spend ≈ $1.05–$1.25.
-    Never inflate more than max(target*1.5, target+8) — if $1 min still
-    requires a much larger size (e.g. ask=1¢ → need ~100 sh), return (0,0)
-    so the engine can abort/unwind instead of opening a 5× imbalance.
+    Default: size ≈ target_shares, quantized for CLOB rules.
+    Polymarket rejects a buy under $1. A cheap hedge (6 shares at 0.08 is
+    $0.48) is increased until the order is at least $1.19. A 1¢ ask that
+    would need ~100 shares is still refused.
     """
-    MIN_NOTIONAL = 1.05
-    BUMP_USD = 1.15
-    MAX_BUMP_USD = 1.25
+    MIN_NOTIONAL = 1.19
     if ask is None or ask <= 0 or target_shares is None or target_shares <= 0:
         return 0.0, 0.0
     ask = float(ask)
@@ -86,37 +88,34 @@ def polymarket_buy_order(target_shares: float, ask: float) -> tuple[float, float
         size = _quantize_buy_size(size, limit)
 
     notional = size * limit if size > 0 else 0.0
-    # 2) Min-notional bump only when cheap (cannot spend $1 with target shares)
+    # 2) Cheap ask: buy enough shares that the order clears $1.19.
     if notional < MIN_NOTIONAL and limit > 0:
-        need = min(MAX_BUMP_USD, max(BUMP_USD, MIN_NOTIONAL))
-        raw = need / limit
-        # Hard cap: never more than 1.5× target or +8 shares (whichever larger).
-        # At ask=0.01, $1 needs ~100 sh — that would be a huge imbalance; refuse.
-        max_size = max(target * 1.5, target + 8.0)
+        raw = MIN_NOTIONAL / limit
+        # 0.08 needs ~15 shares. 0.01 would need ~119 — refuse that imbalance.
+        max_size = max(target * 1.5, target + 8.0, min(raw, 40.0))
         if raw > max_size + 1e-9:
-            # Cannot meet CLOB $1 min without destroying hedge ratio
             return 0.0, 0.0
-        raw = min(raw, max_size)
         size = _quantize_buy_size(raw, limit)
-        # walk up if still under min after quantize (within cap)
-        if size > 0 and size * limit < MIN_NOTIONAL:
-            units = int(math.floor(size * 10000 + 1e-9)) + 1
+        if size <= 0 or size * limit < MIN_NOTIONAL:
+            units = int(math.floor((size or 0) * 10000 + 1e-9)) + 1
             max_units = int(math.floor(max_size * 10000 + 1e-9))
             limit_cents = int(round(limit * 100))
+            size = 0.0
             while units <= max_units:
                 cand = units / 10000.0
                 if (units * limit_cents) % 10000 == 0 and cand * limit >= MIN_NOTIONAL:
                     size = cand
                     break
                 units += 1
-            else:
-                # still under min within allowed size → refuse
+            if size <= 0:
                 return 0.0, 0.0
 
     if size <= 0:
         return 0.0, 0.0
-    # final safety quantize
+    kept = size
     size = _quantize_buy_size(size, limit) or size
+    if size * limit < MIN_NOTIONAL - 1e-9:
+        size = kept
     if size * limit < MIN_NOTIONAL - 1e-9:
         return 0.0, 0.0
     return limit, size
@@ -154,6 +153,7 @@ class PolymarketClient:
             self._http = None
 
     async def _ensure_http(self) -> httpx.AsyncClient:
+        install_public_dns()
         if self._http is None:
             self._http = httpx.AsyncClient(timeout=20.0)
         return self._http
@@ -170,8 +170,23 @@ class PolymarketClient:
                 return data
         except Exception as e:
             self.last_error = str(e)
-            logger.warning("PM event_by_slug %s: %s", slug, e)
+            logger.warning("PM event_by_slug %s: %s", slug, e or type(e).__name__)
         return None
+
+    async def btc_5m_window(self, start: int) -> Optional[dict]:
+        """One BTC 5m window by its start, including a window that is not live yet."""
+        start = int(start)
+        slug = f"btc-updown-5m-{start}"
+        event = await self.event_by_slug(slug)
+        if not event:
+            return None
+        parsed = parse_updown_market(event)
+        if not parsed:
+            return None
+        parsed["slug"] = slug
+        parsed["start"] = float(start)
+        parsed["end"] = float(start + 300)
+        return parsed
 
     async def current_btc_5m(self, now: Optional[float] = None) -> Optional[dict]:
         """Resolve the live BTC 5m window on Polymarket.
@@ -198,6 +213,15 @@ class PolymarketClient:
             parsed["slug"] = slug
             parsed["start"] = float(st)
             parsed["end"] = float(st + dur)
+            # Gamma fills these only after the window settles. They are the
+            # official price-to-beat and final TWAP, not the live last print.
+            meta = event.get("eventMetadata") if isinstance(event.get("eventMetadata"), dict) else {}
+            beat = _f(meta.get("priceToBeat"))
+            final = _f(meta.get("finalPrice"))
+            if beat is not None:
+                parsed["price_to_beat"] = beat
+            if final is not None:
+                parsed["final_price"] = final
             parsed_by_start[st] = parsed
 
         # 1) current window if listed
@@ -237,6 +261,76 @@ class PolymarketClient:
         return None
 
 
+    async def crypto_window_price(self, start_unix: int, timeout: float = 8.0) -> Optional[dict]:
+        """Chainlink open/close for one BTC 5m window.
+
+        Verified live shape:
+        {"openPrice": 63674.70, "closePrice": null, "timestamp": 1795076784710,
+         "completed": false, "incomplete": true, "cached": true}
+        closePrice stays null until the window is completed. It is the official
+        close, not a live last print. Last price comes from the Chainlink socket.
+        """
+        http = await self._ensure_http()
+        try:
+            response = await http.get(
+                CRYPTO_PRICE_URL,
+                params={
+                    "symbol": "btc",
+                    "eventStartTime": str(int(start_unix)),
+                    "variant": "fiveminute",
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json",
+                },
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            body = response.json()
+            return body if isinstance(body, dict) else None
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.debug("PM crypto-price %s: %s", start_unix, exc)
+            return None
+
+    async def chainlink_candles(self, timeout: float = 8.0) -> list:
+        """OHLC candles the Polymarket BTC chart draws.
+
+        The 5-minute page asks for the 60-second TWAP series (the same feed the
+        market settles on): symbol=BTC, interval=5m, limit=30, twapEnabled,
+        twapLookbackSeconds=60. Spot candles flip the small bodies. The last
+        candle is the window that is still open.
+        """
+        http = await self._ensure_http()
+        try:
+            response = await http.get(
+                CHAINLINK_CANDLES_URL,
+                params={
+                    "symbol": "BTC",
+                    "interval": "5m",
+                    "limit": "30",
+                    "twapEnabled": "true",
+                    "twapLookbackSeconds": "60",
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json",
+                    # The edge caches this response for hours. A public hit
+                    # then draws an old rising slice instead of the live chart.
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            body = response.json()
+            candles = body.get("candles") if isinstance(body, dict) else None
+            return list(candles) if isinstance(candles, list) else []
+        except Exception as exc:
+            self.last_error = str(exc) or type(exc).__name__
+            logger.debug("PM chainlink candles: %s", self.last_error)
+            return []
+
     async def resolved_leg_price(self, slug: str, direction: str) -> Optional[float]:
         event = await self.event_by_slug(slug)
         if event:
@@ -252,6 +346,7 @@ class PolymarketClient:
                 )
             except Exception:
                 pass
+        self.last_resolution_closed = False
         res = resolved_updown(event) if event else None
         if res is None:
             # Fallback: /markets?slug= (sometimes more up-to-date than /events)
@@ -272,6 +367,7 @@ class PolymarketClient:
         if not res:
             logger.info("PM resolution slug=%s not final yet (mid prices or open)", slug)
             return None
+        self.last_resolution_closed = bool(res.get("_official"))
         val = res.get(direction.lower())
         logger.info(
             "PM resolution FINAL slug=%s %s=%.4f full=%s",
@@ -443,12 +539,19 @@ class PolymarketClient:
     async def place_market_buy(self, token_id: str, shares: float, price: float) -> dict:
         if not self.settings.is_live:
             limit, size = polymarket_buy_order(shares, price)
-            logger.info("PAPER PM BUY token=%s size=%.4f @ %.4f", token_id, size or shares, limit or price)
+            if size <= 0 or limit <= 0:
+                reason = (
+                    f"PM min-notional impossible at ask={float(price):.4f} "
+                    f"for {float(shares):.2f} sh"
+                )
+                logger.warning("PAPER %s", reason)
+                return {"status": "REJECTED", "reason": reason, "avgPrice": price, "paper": True}
+            logger.info("PAPER PM BUY token=%s size=%.4f @ %.4f", token_id, size, limit)
             return {
                 "status": "FILLED",
                 "orderID": f"paper-pm-{int(time.time()*1000)}",
-                "filledShares": size or shares,
-                "avgPrice": limit or price,
+                "filledShares": size,
+                "avgPrice": limit,
                 "paper": True,
             }
         return await self._live_buy(token_id, shares, price)
@@ -494,7 +597,7 @@ class PolymarketClient:
             logger.info(
                 "PM BUY target %.4f sh ask %.4f → limit %.2f size %.4f maker=$%.2f%s",
                 shares, ask, limit, size, maker,
-                " [min-notional bump]" if (shares * ask < 1.05 and size > shares * 1.02) else "",
+                " [min-notional bump]" if (shares * ask < 1.19 and size > shares * 1.02) else "",
             )
             order_side = BUY
             px, sz = limit, size

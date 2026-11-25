@@ -13,4 +13,5 @@ py-clob-client-v2>=1.2.0
 eth-account>=0.11.0
 web3>=6.0.0
 predict-sdk>=0.0.20
+curl_cffi>=0.7.0
 eth-account>=0.10.0

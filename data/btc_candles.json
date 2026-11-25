@@ -1,0 +1,990 @@
+{
+  "markets": [
+    {
+      "platform": "predict",
+      "market_id": "4753574",
+      "start_ts": 1795542900.0,
+      "end_ts": 1795543200.0,
+      "status": "RESOLVED",
+      "open": {
+        "price": 59935.875,
+        "ts": 1795542900.0,
+        "source": "predict.variantDetails.upDown.startPrice"
+      },
+      "last": {
+        "price": 60047.12916444496,
+        "ts": 1795543199.0,
+        "source": "polymarket.ws.crypto_prices_chainlink"
+      },
+      "close": {
+        "price": 60108.005,
+        "ts": 1795543200.0,
+        "source": "predict.variantDetails.upDown.endPrice"
+      },
+      "open_official": true,
+      "settlement": "CONFIRMED"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4753671",
+      "start_ts": 1795543200.0,
+      "end_ts": 1795543500.0,
+      "status": "RESOLVED",
+      "open": {
+        "price": 60108.005,
+        "ts": 1795543200.0,
+        "source": "predict.variantDetails.upDown.startPrice"
+      },
+      "last": {
+        "price": 60120.21447751444,
+        "ts": 1795543499.0,
+        "source": "polymarket.ws.crypto_prices_chainlink"
+      },
+      "close": {
+        "price": 60190.625,
+        "ts": 1795543500.0,
+        "source": "predict.variantDetails.upDown.endPrice"
+      },
+      "open_official": true,
+      "settlement": "CONFIRMED"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4753746",
+      "start_ts": 1795543500.0,
+      "end_ts": 1795543800.0,
+      "status": "RESOLVED",
+      "open": {
+        "price": 60190.625,
+        "ts": 1795543500.0,
+        "source": "predict.variantDetails.upDown.startPrice"
+      },
+      "last": {
+        "price": 60070.959397998355,
+        "ts": 1795543798.0,
+        "source": "polymarket.ws.crypto_prices_chainlink"
+      },
+      "close": {
+        "price": 60138.005,
+        "ts": 1795543800.0,
+        "source": "predict.variantDetails.upDown.endPrice"
+      },
+      "open_official": true,
+      "settlement": "CONFIRMED"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4753753",
+      "start_ts": 1795543800.0,
+      "end_ts": 1795544100.0,
+      "status": "LIVE",
+      "open": {
+        "price": 60138.005,
+        "ts": 1795543800.0,
+        "source": "predict.variantDetails.upDown.startPrice"
+      },
+      "last": {
+        "price": 60032.16745902842,
+        "ts": 1795543831.0,
+        "source": "polymarket.ws.crypto_prices_chainlink"
+      },
+      "close": null,
+      "open_official": true,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4753763",
+      "start_ts": 1795544100.0,
+      "end_ts": 1795544400.0,
+      "status": "LIVE",
+      "open": null,
+      "last": null,
+      "close": null,
+      "open_official": false,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4753863",
+      "start_ts": 1795544400.0,
+      "end_ts": 1795544700.0,
+      "status": "LIVE",
+      "open": null,
+      "last": null,
+      "close": null,
+      "open_official": false,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4753914",
+      "start_ts": 1795544700.0,
+      "end_ts": 1795545000.0,
+      "status": "LIVE",
+      "open": null,
+      "last": null,
+      "close": null,
+      "open_official": false,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4754061",
+      "start_ts": 1795545000.0,
+      "end_ts": 1795545300.0,
+      "status": "LIVE",
+      "open": null,
+      "last": null,
+      "close": null,
+      "open_official": false,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4754089",
+      "start_ts": 1795545300.0,
+      "end_ts": 1795545600.0,
+      "status": "LIVE",
+      "open": null,
+      "last": null,
+      "close": null,
+      "open_official": false,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4754100",
+      "start_ts": 1795545600.0,
+      "end_ts": 1795545900.0,
+      "status": "LIVE",
+      "open": null,
+      "last": null,
+      "close": null,
+      "open_official": false,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "polymarket",
+      "market_id": "btc-updown-5m-1795542600",
+      "start_ts": 1795542600.0,
+      "end_ts": 1795542900.0,
+      "status": "RESOLVED",
+      "open": {
+        "price": 59940.093779875286,
+        "ts": 1795542600.0,
+        "source": "polymarket.crypto-price.openPrice"
+      },
+      "last": {
+        "price": 59860.77617776137,
+        "ts": 1795542898.0,
+        "source": "polymarket.ws.crypto_prices_chainlink"
+      },
+      "close": {
+        "price": 59862.762474171555,
+        "ts": 1795542961.706,
+        "source": "polymarket.crypto-price.closePrice"
+      },
+      "open_official": true,
+      "settlement": "CONFIRMED"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4754344",
+      "start_ts": 1795545900.0,
+      "end_ts": 1795546200.0,
+      "status": "LIVE",
+      "open": null,
+      "last": null,
+      "close": null,
+      "open_official": false,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "polymarket",
+      "market_id": "btc-updown-5m-1795542900",
+      "start_ts": 1795542900.0,
+      "end_ts": 1795543200.0,
+      "status": "RESOLVED",
+      "open": {
+        "price": 59862.762474171555,
+        "ts": 1795542900.0,
+        "source": "polymarket.crypto-price.openPrice"
+      },
+      "last": {
+        "price": 60047.12916444496,
+        "ts": 1795543199.0,
+        "source": "polymarket.ws.crypto_prices_chainlink"
+      },
+      "close": {
+        "price": 60038.104990728294,
+        "ts": 1795543267.412,
+        "source": "polymarket.crypto-price.closePrice"
+      },
+      "open_official": true,
+      "settlement": "CONFIRMED"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4754355",
+      "start_ts": 1795546200.0,
+      "end_ts": 1795546500.0,
+      "status": "LIVE",
+      "open": null,
+      "last": null,
+      "close": null,
+      "open_official": false,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "polymarket",
+      "market_id": "btc-updown-5m-1795543200",
+      "start_ts": 1795543200.0,
+      "end_ts": 1795543500.0,
+      "status": "RESOLVED",
+      "open": {
+        "price": 60038.104990728294,
+        "ts": 1795543200.0,
+        "source": "polymarket.crypto-price.openPrice"
+      },
+      "last": {
+        "price": 60120.21447751444,
+        "ts": 1795543499.0,
+        "source": "polymarket.ws.crypto_prices_chainlink"
+      },
+      "close": {
+        "price": 60119.542671449315,
+        "ts": 1795543561.117,
+        "source": "polymarket.crypto-price.closePrice"
+      },
+      "open_official": true,
+      "settlement": "CONFIRMED"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4754415",
+      "start_ts": 1795546500.0,
+      "end_ts": 1795546800.0,
+      "status": "LIVE",
+      "open": null,
+      "last": null,
+      "close": null,
+      "open_official": false,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4753480",
+      "start_ts": 1795542300.0,
+      "end_ts": 1795542600.0,
+      "status": "RESOLVED",
+      "open": {
+        "price": 60050.005,
+        "ts": 1795542300.0,
+        "source": "predict.variantDetails.upDown.startPrice"
+      },
+      "last": null,
+      "close": {
+        "price": 60012.005,
+        "ts": 1795542600.0,
+        "source": "predict.variantDetails.upDown.endPrice"
+      },
+      "open_official": true,
+      "settlement": "CONFIRMED"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4753507",
+      "start_ts": 1795542600.0,
+      "end_ts": 1795542900.0,
+      "status": "RESOLVED",
+      "open": {
+        "price": 60012.005,
+        "ts": 1795542600.0,
+        "source": "predict.variantDetails.upDown.startPrice"
+      },
+      "last": null,
+      "close": {
+        "price": 59935.875,
+        "ts": 1795542900.0,
+        "source": "predict.variantDetails.upDown.endPrice"
+      },
+      "open_official": true,
+      "settlement": "CONFIRMED"
+    },
+    {
+      "platform": "polymarket",
+      "market_id": "btc-updown-5m-1795543500",
+      "start_ts": 1795543500.0,
+      "end_ts": 1795543800.0,
+      "status": "SETTLING",
+      "open": {
+        "price": 60119.542671449315,
+        "ts": 1795543500.0,
+        "source": "polymarket.crypto-price.openPrice"
+      },
+      "last": {
+        "price": 60070.959397998355,
+        "ts": 1795543798.0,
+        "source": "polymarket.ws.crypto_prices_chainlink"
+      },
+      "close": null,
+      "open_official": true,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4754475",
+      "start_ts": 1795546800.0,
+      "end_ts": 1795547100.0,
+      "status": "LIVE",
+      "open": null,
+      "last": null,
+      "close": null,
+      "open_official": false,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "polymarket",
+      "market_id": "btc-updown-5m-1795543800",
+      "start_ts": 1795543800.0,
+      "end_ts": 1795544100.0,
+      "status": "LIVE",
+      "open": {
+        "price": 60090.10061331688,
+        "ts": 1795543800.0,
+        "source": "polymarket.crypto-price.openPrice"
+      },
+      "last": {
+        "price": 60032.16745902842,
+        "ts": 1795543831.0,
+        "source": "polymarket.ws.crypto_prices_chainlink"
+      },
+      "close": null,
+      "open_official": true,
+      "settlement": "PENDING"
+    },
+    {
+      "platform": "predict",
+      "market_id": "4754508",
+      "start_ts": 1795547100.0,
+      "end_ts": 1795547400.0,
+      "status": "LIVE",
+      "open": null,
+      "last": null,
+      "close": null,
+      "open_official": false,
+      "settlement": "PENDING"
+    }
+  ],
+  "current": {
+    "polymarket": "btc-updown-5m-1795543800",
+    "predict": "4754508"
+  },
+  "previous": {
+    "polymarket": "btc-updown-5m-1795543500",
+    "predict": "4754475"
+  },
+  "ticks": [
+    {
+      "price": 60059.15084178731,
+      "ts": 1795543725.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60059.15084178731,
+      "ts": 1795543725.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60052.50186900697,
+      "ts": 1795543726.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60054.686635575,
+      "ts": 1795543729.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60054.686635575,
+      "ts": 1795543729.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60054.19991650401,
+      "ts": 1795543730.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60054.19991650401,
+      "ts": 1795543730.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60054.19991650401,
+      "ts": 1795543730.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60054.522932265,
+      "ts": 1795543731.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60054.41133240882,
+      "ts": 1795543732.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60054.41133240882,
+      "ts": 1795543732.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60056.50416894751,
+      "ts": 1795543733.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60056.50416894751,
+      "ts": 1795543733.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60062.3192444844,
+      "ts": 1795543734.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60067.60766516571,
+      "ts": 1795543735.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60067.48537233055,
+      "ts": 1795543736.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60067.48537233055,
+      "ts": 1795543736.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60077.61305970737,
+      "ts": 1795543737.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60077.61305970737,
+      "ts": 1795543737.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60077.61305970737,
+      "ts": 1795543737.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60079.769080656646,
+      "ts": 1795543738.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60078.970019785,
+      "ts": 1795543739.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60077.97297999681,
+      "ts": 1795543740.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60077.97297999681,
+      "ts": 1795543740.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60081.98154764,
+      "ts": 1795543743.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60081.98154764,
+      "ts": 1795543743.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60082.51888082212,
+      "ts": 1795543744.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60082.51888082212,
+      "ts": 1795543744.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60086.19295030188,
+      "ts": 1795543745.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60087.11833190534,
+      "ts": 1795543746.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60086.680130165,
+      "ts": 1795543747.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60090.628586563296,
+      "ts": 1795543748.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60090.628586563296,
+      "ts": 1795543748.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60090.628586563296,
+      "ts": 1795543748.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60110.88151602453,
+      "ts": 1795543749.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60111.99489448603,
+      "ts": 1795543750.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60111.99489448603,
+      "ts": 1795543750.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60110.716655214295,
+      "ts": 1795543751.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60110.716655214295,
+      "ts": 1795543751.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60110.60929020878,
+      "ts": 1795543752.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60110.60929020878,
+      "ts": 1795543752.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60110.82331173585,
+      "ts": 1795543753.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60110.82331173585,
+      "ts": 1795543753.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60110.82331173585,
+      "ts": 1795543753.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60110.82331173585,
+      "ts": 1795543753.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60110.82331173585,
+      "ts": 1795543753.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60110.82331173585,
+      "ts": 1795543753.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60110.82331173585,
+      "ts": 1795543753.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60104.981841658395,
+      "ts": 1795543761.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60104.981841658395,
+      "ts": 1795543761.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60099.200967708646,
+      "ts": 1795543762.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60099.35433574825,
+      "ts": 1795543763.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60099.35433574825,
+      "ts": 1795543763.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60092.39960201208,
+      "ts": 1795543765.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60082.83849123867,
+      "ts": 1795543766.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60088.18126235613,
+      "ts": 1795543767.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60088.18126235613,
+      "ts": 1795543767.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60090.3807887641,
+      "ts": 1795543768.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60090.3807887641,
+      "ts": 1795543768.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60090.527927035,
+      "ts": 1795543769.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60102.95960194368,
+      "ts": 1795543771.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60102.9572139899,
+      "ts": 1795543772.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60103.885177203396,
+      "ts": 1795543775.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60104.883345838745,
+      "ts": 1795543777.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60100.83271007062,
+      "ts": 1795543778.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60100.83271007062,
+      "ts": 1795543778.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60098.629233371605,
+      "ts": 1795543779.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60097.46361404996,
+      "ts": 1795543780.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60097.46361404996,
+      "ts": 1795543780.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60086.504577615735,
+      "ts": 1795543783.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60086.504577615735,
+      "ts": 1795543783.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60091.35837373262,
+      "ts": 1795543784.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60091.35837373262,
+      "ts": 1795543784.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60092.83826854971,
+      "ts": 1795543785.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60092.83826854971,
+      "ts": 1795543785.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60094.742021721686,
+      "ts": 1795543786.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60093.10754182668,
+      "ts": 1795543788.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60093.10754182668,
+      "ts": 1795543788.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60092.00084251476,
+      "ts": 1795543791.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60089.95162312842,
+      "ts": 1795543793.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60089.90216165876,
+      "ts": 1795543794.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60089.90216165876,
+      "ts": 1795543794.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60090.10061331688,
+      "ts": 1795543795.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60090.10061331688,
+      "ts": 1795543795.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60084.816273838864,
+      "ts": 1795543796.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60070.959397998355,
+      "ts": 1795543798.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60070.886995474844,
+      "ts": 1795543800.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60085.08287282365,
+      "ts": 1795543802.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60066.92754033534,
+      "ts": 1795543808.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60065.40987886185,
+      "ts": 1795543810.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60059.31339681235,
+      "ts": 1795543811.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60054.20598945492,
+      "ts": 1795543812.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60054.20598945492,
+      "ts": 1795543812.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60058.24954607118,
+      "ts": 1795543814.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60058.28966169593,
+      "ts": 1795543815.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60058.28966169593,
+      "ts": 1795543815.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60054.67454527519,
+      "ts": 1795543816.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60051.825741688415,
+      "ts": 1795543817.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60051.825741688415,
+      "ts": 1795543817.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60051.370993844415,
+      "ts": 1795543819.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60051.309086177454,
+      "ts": 1795543820.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60050.68184794703,
+      "ts": 1795543821.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60051.15890722008,
+      "ts": 1795543822.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60051.15890722008,
+      "ts": 1795543822.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60051.29640699319,
+      "ts": 1795543823.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60050.50661333345,
+      "ts": 1795543824.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60050.50661333345,
+      "ts": 1795543824.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60050.50661333345,
+      "ts": 1795543824.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60039.87140019573,
+      "ts": 1795543825.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60033.4326431805,
+      "ts": 1795543826.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60033.4326431805,
+      "ts": 1795543826.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60033.4326431805,
+      "ts": 1795543826.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60031.96952040222,
+      "ts": 1795543827.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60030.91629166734,
+      "ts": 1795543828.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60032.55306197615,
+      "ts": 1795543829.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60032.55306197615,
+      "ts": 1795543829.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60034.59753239119,
+      "ts": 1795543830.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60032.16745902842,
+      "ts": 1795543831.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60032.16745902842,
+      "ts": 1795543831.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    },
+    {
+      "price": 60032.16745902842,
+      "ts": 1795543831.0,
+      "source": "polymarket.ws.crypto_prices_chainlink"
+    }
+  ]
+}

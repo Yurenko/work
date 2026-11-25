@@ -38,6 +38,108 @@ def _complement(price: float) -> float:
     return max(0.0, min(1.0, round(1.0 - float(price), 6)))
 
 
+def parse_updown_prices(node: Any) -> dict[str, Any]:
+    """Read Predict's documented up/down BTC prices. Nothing else.
+
+    Category rounds expose `variantDetails.upDown` and `variantDetails.crypto`
+    (UpDownCategoryDetails): priceFeedProvider, priceFeedId, priceFeedSymbol,
+    startPrice (null until the window opens), endPrice (null until it closes).
+    Older payloads put the same numbers on `variantData`.
+    Contract prices (bestBid / bestAsk) are ignored.
+    """
+    empty = {
+        "start_price": None,
+        "end_price": None,
+        "provider": "",
+        "feed_id": "",
+        "symbol": "",
+        "source": "",
+    }
+    if not isinstance(node, dict):
+        return dict(empty)
+
+    candidates: list[tuple[str, Any]] = []
+    details = node.get("variantDetails")
+    if isinstance(details, dict):
+        candidates.append(("predict.variantDetails.upDown", details.get("upDown")))
+        candidates.append(("predict.variantDetails.crypto", details.get("crypto")))
+        if "startPrice" in details or "endPrice" in details or "priceFeedProvider" in details:
+            candidates.append(("predict.variantDetails", details))
+    candidates.append(("predict.variantData", node.get("variantData")))
+    for market in node.get("markets") or []:
+        if not isinstance(market, dict):
+            continue
+        candidates.append(("predict.market.variantData", market.get("variantData")))
+        market_details = market.get("variantDetails")
+        if isinstance(market_details, dict):
+            candidates.append(("predict.market.variantDetails.upDown", market_details.get("upDown")))
+            candidates.append(("predict.market.variantDetails.crypto", market_details.get("crypto")))
+
+    found = dict(empty)
+    for source, obj in candidates:
+        if not isinstance(obj, dict):
+            continue
+        start = _num(obj.get("startPrice"))
+        end = _num(obj.get("endPrice"))
+        provider = str(obj.get("priceFeedProvider") or "")
+        if start is None and end is None and not provider:
+            continue
+        if found["start_price"] is None and start is not None:
+            found["start_price"] = start
+            found["source"] = source
+        if found["end_price"] is None and end is not None:
+            found["end_price"] = end
+            if not found["source"]:
+                found["source"] = source
+        if not found["provider"] and provider:
+            found["provider"] = provider
+        if not found["feed_id"] and obj.get("priceFeedId"):
+            found["feed_id"] = str(obj.get("priceFeedId"))
+        if not found["symbol"] and obj.get("priceFeedSymbol"):
+            found["symbol"] = str(obj.get("priceFeedSymbol"))
+    return found
+
+
+def round_candle(rnd: dict) -> Optional[dict]:
+    """Open, close, and start of one Predict series round, when both prices exist."""
+    if not isinstance(rnd, dict):
+        return None
+    markets = rnd.get("markets") or []
+    market = markets[0] if markets and isinstance(markets[0], dict) else {}
+    prices = parse_updown_prices(rnd)
+    extra = parse_updown_prices(market) if market else {}
+    for key in ("start_price", "end_price"):
+        if prices.get(key) is None and extra.get(key) is not None:
+            prices[key] = extra[key]
+    start = None
+    for raw in (
+        rnd.get("startsAt"),
+        market.get("startsAt") if isinstance(market, dict) else None,
+        rnd.get("slug"),
+        market.get("categorySlug") if isinstance(market, dict) else None,
+        market.get("slug") if isinstance(market, dict) else None,
+    ):
+        number = _num(raw)
+        if number is not None and number > 1e12:
+            number /= 1000.0
+        if number is not None and 1e9 < number < 2e10:
+            start = float(number)
+            break
+        if isinstance(raw, str):
+            import re
+            match = re.search(r"(?:btc-updown-5m-|updown-5m-)(\d{9,12})", raw)
+            if match:
+                start = float(match.group(1))
+                break
+    if start is None:
+        return None
+    return {
+        "start": start,
+        "open": prices.get("start_price"),
+        "close": prices.get("end_price"),
+    }
+
+
 class PredictClient:
     """REST client for https://api.predict.fun
 
@@ -57,6 +159,9 @@ class PredictClient:
         self._jwt: Optional[str] = None
         self._jwt_exp = 0.0
         self.last_error: str = ""
+        # BTC up/down windows seen on the last series fetch, including the
+        # round that just ended. Live trading still uses find_btc_5m_markets().
+        self.updown_windows: list[dict] = []
 
     async def close(self) -> None:
         if self._http is not None:
@@ -252,12 +357,24 @@ class PredictClient:
         """GET /v1/categories/{slug} — includes nested markets."""
         return await self._request("GET", f"/v1/categories/{slug}")
 
-    async def get_series_rounds(self, series_slug: str = "btc-updown-5m", first: int = 10) -> list[dict]:
-        """GET /v1/series/{slug}/rounds — ACTIVE rounds, first = live window."""
+    async def get_series_rounds(
+        self,
+        series_slug: str = "btc-updown-5m",
+        first: int = 10,
+        status: str = "ACTIVE",
+    ) -> list[dict]:
+        """GET /v1/series/{slug}/rounds.
+
+        ACTIVE (default) is the live window plus the rounds already created
+        ahead of it. ENDED is past rounds, newest first.
+        """
+        params = {"first": str(first)}
+        if status:
+            params["status"] = status
         data = await self._request(
             "GET",
             f"/v1/series/{series_slug}/rounds",
-            params={"status": "ACTIVE", "first": str(first)},
+            params=params,
         )
         if isinstance(data, list):
             return data
@@ -265,6 +382,88 @@ class PredictClient:
             return list(data.get("data") or data.get("rounds") or data.get("categories") or [])
         return []
 
+    async def btc_chart_candles(self, count: int = 12) -> list:
+        """OHLC the Predict.fun BTC candle chart draws.
+
+        Settlement start/end can flip a one-dollar body. The chart asks
+        GraphQL assetOhlc for Chainlink BTCUSDT, resolution _5m, feed 1.
+        The last candle is the window that is still open.
+        """
+        query = """
+        query GetAssetOhlc(
+          $priceFeedId: ID!
+          $resolution: OhlcResolution!
+          $countback: Int!
+          $priceFeedProvider: PriceFeedProvider
+        ) {
+          assetOhlc(
+            priceFeedId: $priceFeedId
+            resolution: $resolution
+            countback: $countback
+            provider: $priceFeedProvider
+          ) {
+            data { edges { node { timestamp open high low close } } }
+          }
+        }
+        """
+        payload = {
+            "query": query,
+            "variables": {
+                "priceFeedId": "1",
+                "resolution": "_5m",
+                "countback": max(12, int(count) + 2),
+                "priceFeedProvider": "CHAINLINK",
+            },
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": "https://predict.fun",
+            "Referer": "https://predict.fun/",
+        }
+
+        def _post() -> dict:
+            from curl_cffi import requests as creq
+            response = creq.post(
+                "https://graphql.predict.fun/graphql",
+                json=payload,
+                headers=headers,
+                impersonate="chrome",
+                timeout=8,
+            )
+            response.raise_for_status()
+            body = response.json()
+            if not isinstance(body, dict):
+                return {}
+            return body
+
+        try:
+            body = await asyncio.to_thread(_post)
+        except Exception as exc:
+            self.last_error = str(exc) or type(exc).__name__
+            logger.warning("PF chart candles: %s", self.last_error)
+            return []
+        if body.get("errors"):
+            self.last_error = str(body["errors"][0].get("message") or "ohlc error")
+            logger.warning("PF chart candles: %s", self.last_error)
+            return []
+        self.last_error = ""
+        edges = (
+            ((body.get("data") or {}).get("assetOhlc") or {}).get("data") or {}
+        ).get("edges") or []
+        candles = []
+        for edge in edges:
+            node = edge.get("node") if isinstance(edge, dict) else None
+            if not isinstance(node, dict):
+                continue
+            candles.append({
+                "time": node.get("timestamp"),
+                "open": node.get("open"),
+                "high": node.get("high"),
+                "low": node.get("low"),
+                "close": node.get("close"),
+            })
+        return candles
 
     async def get_market(self, market_id: int | str) -> Optional[dict]:
         return await self._request("GET", f"/v1/markets/{market_id}")
@@ -364,7 +563,15 @@ class PredictClient:
         out: list[dict] = []
         seen: set[str] = set()
 
-        rounds = await self.get_series_rounds("btc-updown-5m", first=12)
+        rounds = await self.get_series_rounds("btc-updown-5m", first=12, status="ACTIVE")
+        try:
+            ended = await self.get_series_rounds("btc-updown-5m", first=3, status="ENDED")
+        except Exception as exc:
+            logger.debug("Predict ended rounds: %s", exc)
+            ended = []
+        if ended:
+            rounds = list(ended) + list(rounds or [])
+        self.updown_windows = []
         if not rounds:
             rounds = []
             cat = await self.get_category("btc-updown-5m")
@@ -455,14 +662,37 @@ class PredictClient:
                 start_ts = start_ts or slug_ts
                 end_ts = slug_ts + 300.0
 
+            title = mkt.get("title") or mkt.get("question") or rnd.get("title") or f"BTC 5m {mid_s}"
+            status = str(mkt.get("tradingStatus") or mkt.get("status") or rnd.get("status") or "OPEN").upper()
+
+            prices = parse_updown_prices(rnd)
+            market_prices = parse_updown_prices(mkt)
+            for key in ("start_price", "end_price", "provider", "feed_id", "symbol"):
+                if prices.get(key) in (None, "") and market_prices.get(key) not in (None, ""):
+                    prices[key] = market_prices[key]
+                    if key in ("start_price", "end_price") and not prices.get("source"):
+                        prices["source"] = market_prices.get("source") or ""
+            if start_ts is not None and end_ts is not None:
+                self.updown_windows.append(
+                    {
+                        "market_id": mid_s,
+                        "start": float(start_ts),
+                        "end": float(end_ts),
+                        "trading_status": status,
+                        "start_price": prices.get("start_price"),
+                        "end_price": prices.get("end_price"),
+                        "provider": prices.get("provider") or "",
+                        "feed_id": prices.get("feed_id") or "",
+                        "symbol": prices.get("symbol") or "",
+                        "source": prices.get("source") or "",
+                    }
+                )
+
             if end_ts is not None and end_ts <= now:
                 continue
             if end_ts is None:
                 logger.warning("Predict market %s missing endsAt (slug=%s) — skip", mid_s, slug)
                 continue
-
-            title = mkt.get("title") or mkt.get("question") or rnd.get("title") or f"BTC 5m {mid_s}"
-            status = str(mkt.get("tradingStatus") or mkt.get("status") or rnd.get("status") or "OPEN").upper()
 
             up_bid = up_ask = None
             for o in mkt.get("outcomes") or []:
@@ -496,6 +726,12 @@ class PredictClient:
                     "round": rnd,
                 }
             )
+
+        deduped: dict[str, dict] = {}
+        for row in self.updown_windows:
+            deduped[str(row.get("market_id"))] = row
+        self.updown_windows = list(deduped.values())
+        self.updown_windows.sort(key=lambda row: float(row.get("start") or 0))
 
         out.sort(key=lambda x: x.get("end") or 0)
         extra = ""

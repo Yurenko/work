@@ -29,6 +29,11 @@ async def index() -> str:
     return "<h1>static/index.html missing</h1>"
 
 
+@app.get("/api/history")
+async def history(limit: int = 20, page: int = 1) -> dict:
+    return get_engine().trade_history.page(limit, page)
+
+
 @app.get("/api/state")
 async def state() -> dict:
     return get_engine().snapshot()
@@ -71,6 +76,20 @@ async def test_buy(body: dict | None = None) -> dict:
 @app.get("/api/health")
 async def health() -> dict:
     return {"ok": True, "mode": get_settings().mode}
+
+
+@app.post("/api/trade-venues")
+async def trade_venues(body: dict | None = None) -> dict:
+    venues = str((body or {}).get("venues") or "both")
+    chosen = get_engine().set_trade_venues(venues)
+    return {"ok": True, "venues": chosen}
+
+
+@app.post("/api/trade-strategy")
+async def trade_strategy(body: dict | None = None) -> dict:
+    strategy = str((body or {}).get("strategy") or "classic")
+    chosen = get_engine().set_trade_strategy(strategy)
+    return {"ok": True, "strategy": chosen}
 
 
 @app.post("/api/reset-recovery")

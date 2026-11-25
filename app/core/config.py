@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     # Keep recovery modest — large sizes + thin PM books caused 17 vs 2.5 imbalance
     max_shares: float = 12.0
     max_recovery_debt_usd: float = 50.0
+    # Recovery doubles the previous entry. BASE hedging stays on the lock-in path.
+    martingale_multiplier: float = 2.0
+    hedging_base_mode: bool = True
+    hedging_recovery_mode: bool = False
+    # A BTC last print older than this, measured back from the window end, is stale.
+    btc_last_max_age_sec: float = 20.0
     bn_min_usd: float = 1.0  # kept name for recovery sizing; means PF min notional
     max_open_hedges: int = 2
     min_time_to_expiry_sec: int = 60
@@ -39,6 +45,16 @@ class Settings(BaseSettings):
     # Example: base=6, extra=4 → PF 10 / PM 6; sell 4 @ entry+0.10.
     pf_extra_shares: float = 4.0
     pf_trim_offset: float = 0.10
+
+    # Same-direction entry near $0.70, then an opposite lock per venue.
+    lockin_enabled: bool = True
+    lock_entry_price: float = 0.70
+    lock_entry_low: float = 0.58
+    lock_entry_high: float = 0.82
+    lock_entry_band: float = 0.12
+    lock_min_net_per_share: float = 0.10
+    pf_taker_fee_bps: float = 200.0
+    max_total_investment_usd: float = 50.0
 
     # Predict.fun
     predict_api_key: str = ""

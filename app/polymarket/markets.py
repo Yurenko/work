@@ -38,8 +38,9 @@ def resolved_updown(event: dict) -> Optional[dict[str, float]]:
     """Return {up: 0|1, down: 0|1} only when market is *fully* resolved.
 
     Mid prices like 0.62/0.38 must return None — never treat as final outcome.
-    Requires BOTH legs at extremes (≈0 and ≈1) summing to ~1. Prefer closed/
-    automaticallyResolved, but allow extreme 0/1 even if closed flag lags.
+    Both legs must sit at the extremes (≈0 and ≈1). Gamma's closed flag often
+    lags many minutes after the book is already 0.995/0.005, so that print is
+    a result. The engine confirms it for a few seconds before closing.
     """
     if not event:
         return None
@@ -89,10 +90,7 @@ def resolved_updown(event: dict) -> Optional[dict[str, float]]:
         return None
     if abs(out["up"] + out["down"] - 1.0) > 0.02:
         return None
-    # Prefer official closed/resolved flag; still accept pure 0/1 (gamma lag)
-    if not (closed or auto or status in {"resolved", "settled"}):
-        # prices are extreme — OK, but caller should still wait min time
-        pass
+    out["_official"] = 1.0 if (closed or auto or status in {"resolved", "settled"}) else 0.0
     return out
 
 
